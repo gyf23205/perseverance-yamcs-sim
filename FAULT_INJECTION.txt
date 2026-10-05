@@ -1,0 +1,488 @@
+================================================================================
+FAULT INJECTION - Perseverance rover in OmniLRS / Isaac Sim
+Slide notes: structure, logic, and fault types
+================================================================================
+
+
+================================================================================
+SLIDE 1 - STRUCTURE AND CONTROL FLOW
+================================================================================
+
+TITLE: Breaking the rover on purpose
+
+--------------------------------------------------------------------------------
+WHAT IT IS - AND WHAT IT IS NOT
+--------------------------------------------------------------------------------
+
+    NOT ground control. A SIMULATION BACKDOOR that rides the ground-control
+    transport, because the transport already exists and the Yamcs command form
+    is a convenient interface.
+
+    It reaches PAST the rover software and breaks something real: an actuator,
+    a sensor, the battery, or the link itself.
+
+    Everything artificial lives under /Rover/faults - commands and telemetry
+    alike - so an injected value can never be read as a real measurement.
+
+    WHY: a closed-loop controller is only interesting when something fights it.
+
+
+--------------------------------------------------------------------------------
+FIVE INJECTION POINTS, ONE STRUCTURE
+--------------------------------------------------------------------------------
+
+    ACTUATION   wheel torque, wheel stuck,              -> joint drive limits,
+                steer torque, steer stuck                  damping, overrides
+    TRACTION    wheel slip, wheel sink                  -> wheel physics materials,
+                                                           collider offsets, per-step drag
+    SENSING     imu bias/noise, camera loss/noise       -> the sensor accessors
+    POWER       parasitic load                          -> the power model
+    LINK        telemetry loss, telecommand loss        -> the tm/tc chokepoints
+
+    Sensor faults are applied AT THE SENSOR, not on the way out, so every
+    consumer sees the same broken device. A biased imu therefore also shifts the
+    thermal and power numbers, which use imu yaw for the sun angle. Driving is
+    unaffected: the controller closes its loop on ground-truth pose, so an imu
+    fault misleads the OPERATOR, not the rover's feet.
+
+
+--------------------------------------------------------------------------------
+BLOCK DIAGRAM - the fault path enters BELOW the controller
+--------------------------------------------------------------------------------
+
+   GROUND                       ROVER (Isaac Sim process)
+  +----------------+           +---------------------------------------------+
+  | Yamcs web UI   |           |  CommandsHandler        (TC listener THREAD) |
+  |  /Rover/faults |--- UDP -->|         |                                   |
+  +----------------+           |         v                                   |
+                               |  PerseveranceCommander                      |
+  --fault CLI flag ------------+-------> |                                   |
+   (same code path,            |         v                                   |
+    no ground station)         |  FaultInjector.inject_*()   ==> QUEUE ONLY  |
+                               |         :                                   |
+                               |  - - - -:- - - - - - - - - - - - - - - - -  |
+                               |         :          THREAD BOUNDARY          |
+                               |  - - - -:- - - - - - - - - - - - - - - - -  |
+                               |         v                                   |
+                               |  FaultInjector.update()   (SIMULATION LOOP) |
+                               |         |                                   |
+                               |    +----+----+-----------+---------+        |
+                               |    v         v           v         v        |
+   DriveController --30 Hz-->  | joints   sensors      power     tm/tc       |
+   (joint TARGETS)             | (limits) (bias,noise) (load)   (drops)      |
+                               +---------------------------------------------+
+
+  The controller is NEVER TOLD a fault happened. It has to discover it as a
+  tracking error - which is the only reason a fault is interesting to watch.
+
+
+--------------------------------------------------------------------------------
+THE ONE STRUCTURAL RULE: QUEUE, THEN APPLY
+--------------------------------------------------------------------------------
+
+    Commands arrive on the telecommand LISTENER THREAD.
+    Applying an actuator fault ends in a USD WRITE.
+    Authoring usd off the simulation thread DEADLOCKS Kit.
+
+    Failure mode when this is violated (observed, not theoretical):
+        - simulation freezes mid-command
+        - the freeze also stops the downlink
+        - so the ground keeps showing HEALTHY telemetry
+        => the fault looks like it was never received
+
+    THE FIX - the same split the drive controller already uses:
+        inject_*()  ->  append to a locked queue, return immediately
+        update()    ->  drain the queue, apply, refresh health
+                        (called once per physics step, ~33 ms latency)
+
+    update() is the ONLY function that changes anything. The sensor, power and
+    link faults would survive being applied in place; they go through the same
+    queue so there is exactly ONE path from command to effect.
+
+
+--------------------------------------------------------------------------------
+MECHANISM - what actually gets written
+--------------------------------------------------------------------------------
+
+    Torque faults -> usd attribute  drive:angular:physics:maxForce
+
+    The usd authors NO maxForce, so a healthy joint is UNLIMITED (inf).
+      => there is no absolute nominal for an N*m value to be a fraction OF
+      => the robot config supplies a REFERENCE, used only to size a fault
+      => clearing writes inf back, never the reference
+      => inject-then-clear is an EXACT ROUND TRIP
+
+    Wheel stuck   -> usd attribute  drive:angular:physics:damping, x factor
+                     AND the velocity target / factor, in set_wheel_velocities.
+
+    The drive joints are VELOCITY drives: stiffness 0, damping 25000. Their
+    damping is the gain that pulls the wheel TOWARD the commanded speed, so
+    raising it alone makes the wheel track the command harder - not stuck.
+    A seized bearing is a passive brake B on top of a healthy motor D:
+
+        D (w_cmd - w) - B w  =  (D + B) (w_cmd * D/(D+B) - w)
+
+      => damping x factor, target / factor, factor = (D+B)/D = 1/(1-severity)
+      => severity = fraction of free-running speed lost
+      => capped at max_wheel_stuck_damping_factor (1000) - what 1.0 means
+      => nominal damping read from the usd once, written back on clear
+
+    Wheel slip    -> usd physics material, one per wheel, bound to its colliders
+                     static + dynamic friction = (1 - severity) x 0.5
+
+    The usd binds NO physics material, so every contact uses the PhysX default
+    (friction 0.5, combine average). Each wheel gets its own material AT LOAD,
+    at that same 0.5 - a healthy run is unchanged.
+      => BOUND AT LOAD, before physics steps: PhysX may not re-parse a new
+         binding on a running shape. A fault only changes VALUES on an
+         already-bound material, which PhysX applies live -> works mid-run
+      => combine mode MIN: priority is max > multiply > min > average, the
+         ground uses average, so the wheel wins and cannot be averaged back up
+      => clearing writes 0.5 back - exact round trip
+
+    Wheel sink    -> TWO effects, both x severity:
+                     collider rest offset = -severity x 0.03 m   (sits lower)
+                     drag = severity x 0.6 x normal load, every step (ploughs)
+
+    Low friction removes the PUSH; soft soil ADDS a force holding the rover
+    back. Both show the encoder running ahead of the pose - what separates
+    them is /Rover/motor_effort: near zero on ice, high in soft soil.
+      => rest offset authored at load (0), fault writes a negative value
+      => drag is an external world-frame force at the wheel hub, against its
+         horizontal velocity, sized by the load it carries (last step's
+         contact force). Lifted wheel -> no load -> no drag
+      => external forces last ONE step, so update() reapplies it every step
+         while a sink fault is active - the only fault that is not set-once
+      => below 0.05 m/s the drag fades linearly, instead of flipping sign at
+         a 33 ms step
+      => 0.6 > 0.5 friction on purpose: ALL at 1.0 drags harder than the
+         wheels can grip -> they spin, the rover stalls
+
+    Steer stuck   -> a python override applied inside Robot.set_steer_angles,
+                     re-applied on EVERY write, so it holds against a
+                     controller that rewrites all four targets at 30 Hz.
+
+    Sensor faults -> applied inside Robot.get_imu_readings /
+                     get_rgba_camera_view, so consumers cannot bypass them.
+
+    Battery fault -> a REAL load added to PowerModel._total_load_power, not a
+                     poke at the stored charge, so it shows up in net_power,
+                     total_current_out AND a battery curve that bends.
+
+    Link faults   -> a drop test at the two chokepoints every value passes
+                     through: transmit_to_yamcs down, the command callbacks up.
+
+
+================================================================================
+SLIDE 2 - THE FAULT TYPES
+================================================================================
+
+TITLE: Ten ways to break a rover
+
+--------------------------------------------------------------------------------
+SEVERITY: HEALTHY (0.0) --> DEAD (1.0).  Bigger is always worse.
+          Every magnitude scales a reference from the robot config.
+          One rule for every fault - no per-subsystem units to learn.
+--------------------------------------------------------------------------------
+
+  +--------------------------+--------------------+--------------------------+
+  | COMMAND                  | ARGUMENTS          | WHAT THE ROVER DOES      |
+  +--------------------------+--------------------+--------------------------+
+  | inject_wheel_torque_     | wheel (6) or ALL   | motor too weak to push:  |
+  |   fault                  | severity 0..1      | rover CRABS off course,  |
+  |                          |                    | STALLS on a slope        |
+  +--------------------------+--------------------+--------------------------+
+  | inject_wheel_stuck_      | wheel (6) or ALL   | wheel SEIZED: resists    |
+  |   fault                  | severity 0..1      | turning, skids, rover    |
+  |                          |                    | PULLS toward that side   |
+  +--------------------------+--------------------+--------------------------+
+  | inject_wheel_slip_       | wheel (6) or ALL   | wheel loses GRIP: spins  |
+  |   fault                  | severity 0..1      | at full speed, rover     |
+  |                          |                    | hardly moves; slides on  |
+  |                          |                    | a slope                  |
+  +--------------------------+--------------------+--------------------------+
+  | inject_wheel_sink_       | wheel (6) or ALL   | wheel SUNK in soft soil: |
+  |   fault                  | severity 0..1      | rover slows, stops fast, |
+  |                          |                    | effort HIGH, body lower  |
+  +--------------------------+--------------------+--------------------------+
+  | inject_steer_torque_     | corner (4) or ALL  | corner LAGS the          |
+  |   fault                  | severity 0..1      | commanded angle - late   |
+  |                          |                    | and short, arcs go wide  |
+  +--------------------------+--------------------+--------------------------+
+  | inject_steer_stuck_      | corner             | corner FROZEN at one     |
+  |   fault                  | angle (deg)        | angle, ignores the       |
+  |                          |                    | controller entirely      |
+  +--------------------------+--------------------+--------------------------+
+  | inject_imu_fault         | bias 0..1          | accel/gyro/attitude go   |
+  |                          | noise 0..1         | offset and jittery; the  |
+  |                          |                    | thermal model drifts too |
+  +--------------------------+--------------------+--------------------------+
+  | inject_camera_fault      | loss 0..1          | frames vanish; the ones  |
+  |                          | noise 0..1         | that arrive are grainy   |
+  +--------------------------+--------------------+--------------------------+
+  | inject_battery_fault     | severity 0..1      | parasitic load drains    |
+  |                          |                    | the pack; net_power dives|
+  +--------------------------+--------------------+--------------------------+
+  | inject_comms_fault       | tm_loss 0..1       | telemetry gaps; commands |
+  |                          | tc_loss 0..1       | silently ignored         |
+  +--------------------------+--------------------+--------------------------+
+  | clear_faults             | -                  | every subsystem back to  |
+  |                          |                    | nominal                  |
+  +--------------------------+--------------------+--------------------------+
+
+  ONE GUARANTEE: clear_faults is NEVER dropped, however high tc_loss goes.
+  Otherwise inject_comms_fault(tc_loss=1.0) is unrecoverable - the one command
+  that lifts the fault is the one being discarded.
+
+  Two entry points, one code path:
+      Yamcs command                     (live, during a run)
+      --fault wheel_torque:mid_left:0.8 (at launch, no ground station needed)
+      --fault-seed 0                    (noise and losses replay exactly)
+
+
+--------------------------------------------------------------------------------
+SIZING - where the numbers come from
+--------------------------------------------------------------------------------
+
+    Rover at scale 0.35, lunar gravity, ~1025 kg authored mass,
+    wheel radius 0.0919 m:
+
+        holding a 15 deg slope ....... ~6.6 N*m per wheel
+        accelerating at 0.5 m/s^2 .... ~7.8 N*m per wheel
+
+        => nominal_wheel_torque = 20 N*m   (interesting range 0.6-0.7)
+        => nominal_steer_torque = 150 N*m  (steer joints already resist ~51)
+
+    Same rule everywhere else, each with its own reference:
+        max_imu_accel_bias        2.0 m/s^2
+        max_imu_gyro_bias         0.5 rad/s
+        max_imu_orientation_bias  20 deg     <- this is what reaches the
+                                                thermal and power models
+        max_camera_noise          80 of 255
+        max_parasitic_load        40 W       <- off a 60 Wh pack
+
+
+--------------------------------------------------------------------------------
+HEALTH IS GROUND TRUTH, NOT A DIAGNOSIS
+--------------------------------------------------------------------------------
+
+    The injector knows exactly what it broke, so it names the ACTUATOR or the
+    subsystem rather than flagging the rover. Nothing is inferred from dynamics.
+
+        /Rover/faults/wheel_health .............. 6 states, one per drive motor
+                                                  (worst of torque, stuck, slip,
+                                                  sink)
+        /Rover/faults/wheel_damping_factor ...... 6 multipliers, 1.0 healthy
+        /Rover/faults/wheel_friction ............ 6 coefficients, 0.5 healthy
+        /Rover/faults/wheel_sinkage ............. 6 depths in m, 0 healthy
+        /Rover/faults/steer_health .............. 4 states, one per corner
+        /Rover/faults/motor_controller_health ... coarse mobility summary
+        /Rover/faults/imu|camera|battery|comms_health ... one per family
+        /Rover/faults/parasitic_load ............ W, the battery observable
+        /Rover/faults/dropped ................... cumulative tm/tc/frame losses
+
+        NOMINAL   untouched
+        DEGRADED  severity between 0 and 1
+        FAULT     severity 1.0, or a stuck steer corner
+
+    TWO DELIBERATE LIMITS:
+
+      1. DEGRADED IS NOT AN INTERLOCK. The drive interlock trips on FAULT only.
+         A weak actuator must keep driving - a rover that refused to move would
+         hide exactly what the fault was injected to show.
+
+      2. AN INJECTED FAULT NEVER SETS A DEVICE TO FAULT. Six dead wheels report
+         FAULT individually while the summary stays DEGRADED: the rover is
+         cleared to drive and simply cannot. FAULT is reserved for the hardware
+         itself - power_electronics(MOTOR_CONTROLLER, OFF).
+
+
+--------------------------------------------------------------------------------
+WHAT THE OPERATOR SEES - the observables
+--------------------------------------------------------------------------------
+
+    ARTIFICIAL (what was injected)      /Rover/faults/...
+        active .................. "wheel_torque[mid_left]=0.80; imu[...]"
+        wheel_torque_limit (6) .. N*m per drive joint
+        wheel_damping_factor (6)  drive damping multiplier, 1.0 healthy
+        wheel_friction (6) ...... ground friction, 0.5 healthy
+        wheel_sinkage (6) ....... m below the surface, 0 healthy
+        steer_torque_limit (4) .. N*m per corner
+        the seven health states, parasitic_load, dropped
+
+    REAL (what the rover measured)      /Rover/...
+        pose_ground_truth ....... lateral DRIFT a clean run does not have
+        motor_effort (6) ........ measured drive torque: LOW on ice (slip),
+                                  HIGH in soft soil (sink)
+        steer_encoder (4) ....... stuck corner = CONSTANT angle
+                                  weak corner  = LAGS the command
+        imu_accelerometer ....... constant OFFSET under a bias fault
+        temperature_* ........... shifts too - the imu feeds the sun angle
+        net_power/battery_charge  dive and bend under a battery fault
+        camera/images_navcam/number  stops advancing when frames are lost
+        command_distance_remaining  flattens out when the rover stalls
+
+    steer_encoder and the image metadata are deliberately NOT under /faults:
+    they are genuine readings, and they are what make a fault visible at all.
+
+
+--------------------------------------------------------------------------------
+VERIFIED
+--------------------------------------------------------------------------------
+
+    --fault wheel_torque:ALL:1.0  ->  rover COMPLETELY IMMOBILE under throttle
+        confirms the limit reaches the running articulation and PhysX enforces
+        it. Unambiguous regardless of the drive-type unit question.
+
+    Yamcs uplink -> acknowledged, applied, simulation keeps stepping.
+    clear_faults -> exact round trip back to the pre-fault rover.
+
+    198 host checks (test/test_fault_injector.py 132,
+    test/test_fault_tc_path.py 66): all 10 inject commands over the real wire
+    format, the threading rule, the health ladder, determinism, and the
+    clear_faults uplink exemption.
+
+    NOT YET RUN IN ISAAC SIM: wheel stuck, slip and sink, and motor_effort.
+    They pass the host tests only.
+
+
+================================================================================
+SUPPORTING NUMBERS
+================================================================================
+
+    Fault commands ............ 11       (10 inject + clear_faults)
+    Fault telemetry ........... 15 params (+ steer_encoder and motor_effort,
+                                          real measurements)
+    Total TM / TC ............. 63 parameters (58 at 1 Hz + 5 nav-cam image
+                                metadata), 18 commands (7 flight + 11 fault)
+    Image downlink ............ 1 nav-cam frame every 5 s, into a Yamcs bucket
+    Apply latency ............. 1 physics step (~33 ms)
+    Targets ................... 6 wheels, 4 corners, ALL fan-out
+
+    Code:
+      src/mission_specific/perseverance/faults/fault_injector.py
+          queue + registry + health;  NO omni/pxr imports, host-testable
+      src/robots/robot.py                    joint limits, sensor corruption
+      src/subsystems/robot_physics_models/power_model.py   parasitic load
+      src/mission_specific/perseverance/tmtc/perseverance_controller.py
+          the two link chokepoints
+      cfg/robot/perseverance.yaml            fault_injection references
+      cfg/mdb/perseverance.xml               /Rover/faults commands + params
+
+================================================================================
+DATASET GENERATION  (--dataset-out)
+================================================================================
+
+    The same injector, driven by a scheduler instead of an operator, to build a
+    labelled dataset for training fault detection.
+
+        run_perseverance.py --headless --dataset-out my_files/datasets/run01 \
+                            --episodes 100
+
+    ONE INJECTION PATH.  The scheduler calls the same public inject_* methods the
+    Yamcs commander calls.  Proven, not assumed: test_fault_tc_path.py drives each
+    of the 10 fault kinds down both routes and asserts the resulting state is
+    identical -- joint limits, sensor corruption, parasitic load, health flags and
+    the /Rover/faults/active string.
+
+    ONE EPISODE
+        fresh spawn pose, fresh fault schedule, fresh randomized mission
+        full reset between episodes:  battery to 100%, face temperatures cleared,
+        obc uptime restarted, every fault cleared, go/nogo set to GO
+        a seeded random operator chains goto / drive_straight / drive_turn,
+        completing on measured pose rather than elapsed time
+
+    EPISODE MIX          nominal      60%   <- a detector needs negatives
+                         single       28%
+                         concurrent    9%   <- overlapping in time
+                         sequential    3%   <- one recovers, another begins
+                         crater      (+0.15 weight, only with --crater)
+
+    CRATER EPISODES  (--crater)
+        Not a fault - nothing on the rover breaks - so an episode CLASS, stamped
+        into the height map between episodes (mid-run would stall the collider
+        rebuild and float the rocks, for no gain: the hazard is passive).
+        Traps because walls are 30-45 deg > atan(0.5 friction) = 26.6 deg.
+        Per episode: position, radius, slope, depth, rim, ellipse, roughness,
+        spawn bearing and distance.
+            trapped 70%   approach outside keep-out -> dash over rim -> escapes
+            avoid   15%   never approaches         <- negatives with a crater
+            skirt   15%   passes just outside rim  <- in view
+        Label from the TRUE POSE (oracle.crater.in_crater), not the plan.
+        30% of crater episodes also carry one injected fault.
+
+        Onsets sit in the MIDDLE of the episode, never at t=0, so every faulted
+        episode holds three phases: clean baseline, transition, settled regime.
+        Sample-level faulted fraction is therefore ~15-20%, far below the 40%
+        episode-level rate.  The manifest reports both.
+
+    OBSERVABLE  vs  ORACLE
+        observable/telemetry.csv    IS the downlink -- the recorder drives the real
+                                    PerseveranceTransmitter, pointed at a file
+        observable/commands.jsonl   what the ground sent; delivered=false was lost
+        observable/images/          the downlinked frames, corrupted if faulted
+        oracle/truth.csv            clean imu + EXACT residual, true pose, true
+                                    battery Wh, real torque limits, health, label
+        oracle/faults.jsonl         the instant each fault took effect
+        oracle/schedule.json        the sampled schedule
+
+        pose_ground_truth moves to oracle.  contact forces and command progress
+        stay observable but are tagged derived_from_truth in the manifest.
+
+    A COMMS FAULT IS MISSING DATA
+        tm_loss is applied per parameter, so each column gets its own gaps and a
+        lost value is an empty cell -- the only form in which a link fault could
+        reach a detector.  Columns are registered BEFORE the gate, so a parameter
+        dropped on every tick of an episode still has its column and the episodes
+        stay concatenable.
+
+    VERIFIED IN SIMULATION  (3 episodes, then 2 more targeting the sensors)
+
+        column sets identical across episodes ...... yes
+        (this run predates wheel stuck/slip/sink and motor_effort, so today's
+         column counts are higher than the 63 observable / 65 oracle it had)
+        nominal episode truly clean ................ 0 fault events, label 0 throughout
+        scheduled == applied ....................... every episode
+        label 0 before onset, 1 after .............. every faulted episode
+        battery reset between episodes ............. 60.00 Wh each start
+        comms tm_loss=0.82 ......................... 572 parameters dropped,
+                                                     843 empty cells, battery% -> NaN
+        imu bias severity 0.989398 ................. residual 1.978796 m/s^2
+                                                     (0.989398 x 2.0 exactly),
+                                                     yaw 19.787964 deg (x 20.0),
+                                                     0.000000 before onset
+        camera loss=0.89 ........................... both post-onset frames lost,
+                                                     3 pre-onset frames saved
+
+    ROBUSTNESS  (both found by running it, not by reading it)
+
+        physics divergence  PhysX put the rover at ~1e13 m after it drove near the
+                            terrain edge, and every later reading was NaN.  The
+                            runner now abandons that episode, KEEPS the rows taken
+                            before the blow-up, and recovers on the next reset --
+                            or stops the run if the rover does not come back.
+                            Waypoints are clamped to the terrain.
+        falling off terrain 13 of 20 episodes in run01 drove over the edge on a
+                            drive_straight. Straights are now cut short at the
+                            mission bounds, and a rover outside the DEM or 0.5 m
+                            below the ground ends the episode as "aborted: fell
+                            off terrain", discarding the last 3 s.
+        stale directories   an episode directory is cleared as it is written, so a
+                            shorter re-run cannot leave the previous run's frames
+                            behind looking like this episode's data.
+
+    Code:
+      src/mission_specific/perseverance/dataset/
+          fault_scheduler.py    sampling rules      (no omni, host-testable)
+          recorder.py           observable/oracle   (no omni, host-testable)
+          mission_scripter.py   the random operator (no omni, host-testable)
+          crater.py             crater stamping     (no omni, host-testable)
+          episode_runner.py     the loop and the reset sequence
+      cfg/robot/perseverance.yaml            dataset: block
+      scripts/verify_dataset.py              read a dataset back with pandas
+      test/test_dataset_scheduler.py         38 checks
+      test/test_dataset_recorder.py          48 checks
+      test/test_dataset_episode.py           94 checks, whole loop on fakes
+      test/test_dataset_crater.py            55 checks
+
+================================================================================

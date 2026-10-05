@@ -80,6 +80,21 @@ parser.add_argument("--controller-cfg", default="cfg/controller/perseverance-con
                     help="Ground-station controller config, used with --yamcs")
 parser.add_argument("--mode-cfg", default="cfg/mode/Yamcs.yaml",
                     help="Yamcs instance config (address/instance/ports), used with --yamcs")
+parser.add_argument("--fault", action="append", default=[], metavar="KIND:TARGET:MAGNITUDE",
+                    help="Inject a fault at startup, repeatable. Severity always runs healthy (0) "
+                         "to dead (1). "
+                         "wheel_torque:<wheel|ALL>:<severity>, "
+                         "wheel_stuck:<wheel|ALL>:<severity>, "
+                         "wheel_slip:<wheel|ALL>:<severity>, "
+                         "wheel_sink:<wheel|ALL>:<severity>, "
+                         "steer_torque:<corner|ALL>:<severity>, "
+                         "steer_stuck:<corner|ALL>:<angle deg>, "
+                         "imu:<bias>:<noise>, camera:<loss>:<noise>, battery:<severity>, "
+                         "comms:<tm_loss>:<tc_loss>. Same effect as the /Rover/faults commands, "
+                         "but reproducible and usable without a ground station.")
+parser.add_argument("--fault-seed", type=int, default=0,
+                    help="Seed for injected sensor noise and packet loss. Fixed by default so a "
+                         "faulted run replays identically.")
 args, _extra = parser.parse_known_args()
 
 # ── Parse comma-or-space coordinate args ─────────────────────────────────────
@@ -155,6 +170,10 @@ from src.mission_specific.perseverance.control.ackermann_model import (
     AckermannModel, RoverGeometry as AckermannGeometry,
 )
 from src.mission_specific.perseverance.control.drive_controller import PerseveranceDriveController
+
+# OmniLRS — fault injection. Not rover software: a simulation backdoor that breaks actuators on
+# command so the closed loop can be watched compensating.
+from src.mission_specific.perseverance.faults.fault_injector import FaultInjector
 
 import yaml
 
@@ -265,6 +284,11 @@ world = World(
     physics_dt=PHYSICS_DT,
     rendering_dt=RENDERING_DT,
 )
+# World() creates the physics scene with Isaac Sim's Earth default (9.81). OmniLRS's own simulation
+# manager applies cfg/physics/default_physics.yaml (-1.62); this script builds World directly, so it
+# sets lunar gravity itself, before any physics step.
+world.get_physics_context().set_gravity(-1.62)
+print("[sim] Gravity: 1.62 m/s^2", flush=True)
 
 print("[sim] Warm-up pass 1 (physics init) …")
 for _ in range(100):
@@ -305,6 +329,10 @@ stage.DefinePrim("/World", "Xform")
 RM = RobotManager(_robot_settings, mode=SimulatorMode.YAMCS)
 RM.preload_robot(world)
 ROVER_PRIM = RM.robot.robot_path
+# Before any physics step: the wheel slip and sink faults need their per-wheel materials and collider
+# offsets authored while PhysX still
+# has to parse the rover. Later faults only change values, which is safe mid-run.
+FaultInjector.prepare_robot(RM.robot, _robot_settings["parameters"].get("fault_injection", {}))
 
 rover_prim  = stage.GetPrimAtPath(ROVER_PRIM)
 xform_cache = UsdGeom.XformCache()
@@ -359,6 +387,22 @@ drive_controller = PerseveranceDriveController(
     RM.robot, RM.robot_RG, AckermannModel(_geometry), _drive_cfg
 )
 
+# ── Fault injection ───────────────────────────────────────────────────────────
+# Sits below the controller, at the joints: the controller does not know a fault happened and has to
+# discover it as a tracking error, exactly as it would on a real rover.
+_fault_cfg = dict(_robot_settings["parameters"].get("fault_injection", {}))
+fault_injector = FaultInjector(RM.robot, _fault_cfg, seed=args.fault_seed)
+
+# ── Onboard navigation filter ─────────────────────────────────────────────────
+# EKF on the rover's own sensors, ticked after the faults every step; residuals under /Rover/estimator.
+from src.mission_specific.perseverance.estimation.nav_filter import NavFilter
+
+_estimator_cfg = dict(_robot_settings["parameters"].get("estimator", {}))
+nav_filter = None
+if _estimator_cfg.get("enabled", True):
+    nav_filter = NavFilter(RM.robot, drive_controller, _geometry, _estimator_cfg,
+                           steer_sign=drive_controller.steer_sign, gravity=1.62)
+
 keyboard_enabled = not args.headless
 input_iface = keyboard = None
 
@@ -407,12 +451,21 @@ if args.yamcs:
         RM.robot.robot_name.replace("/", ""),
         RM.robot_RG,
         RM.robot,
+        drive_controller,
+        fault_injector,
+        nav_filter=nav_filter,
     )
     TMTC.setup_command_callbacks(RM.RM_conf.yamcs_tmtc["commands"])
     TMTC.start_streaming_data()
     print(f"[gs] Downlink every {RM.RM_conf.yamcs_tmtc['intervals']['robot_stats']}s; "
           f"listening for commands on "
           f"{_instance_conf['tc_receive_address']}:{_instance_conf['tc_receive_port']}")
+
+# ── Startup faults ────────────────────────────────────────────────────────────
+# Queued here; they land on the first fault_injector.update() in the loop below, like any fault
+# arriving from the ground - there is only one code path that touches the stage.
+for _spec in args.fault:
+    fault_injector.apply_spec(_spec)
 
 # ── Simulation loop ───────────────────────────────────────────────────────────
 timeline = omni.timeline.get_timeline_interface()
@@ -467,6 +520,14 @@ while simulation_app.is_running():
 
         if not manual_active:
             drive_controller.update()
+
+        # Apply any fault the ground asked for. Has to happen here, on the simulation thread: the
+        # commands arrive on the telecommand listener thread and end in a usd write, which deadlocks
+        # Kit if done there.
+        fault_injector.update()
+
+        if nav_filter is not None:
+            nav_filter.update(PHYSICS_DT)
 
         # Subsystems step. The sun position is pushed in so the power and thermal models track the
         # live stellar engine rather than the static fallback. OBC state is set by the drive

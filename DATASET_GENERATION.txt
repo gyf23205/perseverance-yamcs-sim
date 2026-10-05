@@ -1,0 +1,215 @@
+================================================================================
+AUTOMATIC DATASET GENERATION - Perseverance rover in OmniLRS / Isaac Sim
+One-slide brief: feed this to a slide generator
+================================================================================
+
+TITLE: The simulator labels its own data
+
+ONE-LINE PITCH
+    --dataset-out turns the simulator into a data generator: a seeded random
+    operator drives the rover, faults appear on a seeded random schedule, and
+    the whole run is recorded twice - once as the ground could see it, once as
+    the simulator knows it. The injected faults ARE the labels.
+
+    Command: run_perseverance.py --headless --dataset-out DIR --episodes 100
+    No ground station involved.
+
+--------------------------------------------------------------------------------
+THE PIPELINE - four modules, one loop
+--------------------------------------------------------------------------------
+
+    seed --> FaultScheduler   : samples ONE fault schedule per episode, up front
+         --> MissionScripter  : the operator, replaced by an RNG
+         --> EpisodeRunner    : resets, steps physics, plays the schedule
+         --> DatasetRecorder  : writes observable/ and oracle/ per episode
+
+  BLOCK DIAGRAM
+
+   dataset_seed
+        |
+        v
+   episode_seed = seed*100003 + index      (one seed -> everything)
+        |
+        +---> FaultScheduler.generate() -----> schedule.json  (sampled up front)
+        +---> MissionScripter(seed)      \
+        +---> random.seed()  (noise models)\
+        |                                   v
+        v                          +-------------------------------+
+   _reset_episode()                |   PER-STEP LOOP (~33 ms)      |
+   - clear all faults              |  1. pop due fault events      |
+   - teleport + random heading     |     -> injector.inject_*()    |
+   - battery -> 100%               |  2. scripter issues next cmd  |
+   - face temps -> initial         |  3. drive_controller.update() |
+   - OBC uptime restart            |  4. fault_injector.update()   |
+   - GO/NOGO -> GO                 |  5. power + thermal integrate |
+   - randomize rocks (/terrain)    |  6. downlink tick   @ 1 Hz    |
+   - stamp/remove crater (--crater)|  7. nav-cam frame   @ 0.2 Hz  |
+   - settle 30 steps               |                               |
+                                   +-------------------------------+
+                                                |
+                                                v
+                                   observable/  |  oracle/
+                                   telemetry.csv|  truth.csv
+                                   commands.json|  faults.jsonl
+                                   images/      |  schedule.json
+
+  Loop ORDER is load-bearing and identical to the interactive loop: commands,
+  drive, faults, power - all between world.step() calls. Nothing writes USD off
+  the simulation thread.
+
+--------------------------------------------------------------------------------
+IDEA 1 - THE SCHEDULE IS SAMPLED, NOT SCRIPTED
+--------------------------------------------------------------------------------
+
+  Episode class          share   what happens
+  --------------------   -----   -----------------------------------------
+  nominal                 60%    no fault at any point
+  single                  28%    one fault (25% of those recover on their own)
+  concurrent               9%    two different kinds overlapping in time
+  sequential               3%    one recovers, then another begins
+  crater (--crater only)  +0.15  steep crater; trapped 70% / avoid 15% /
+                                 skirt 15%, 30% also carry one fault
+
+  THREE SAMPLING RULES, each from what the dataset is FOR:
+
+  MAJORITY NOMINAL     a detector needs negatives -> 60% of episodes clean
+
+  ONSET IN THE MIDDLE  every onset lands in the 40-60% window, never t=0, so
+                       each faulted episode holds THREE PHASES:
+                       clean baseline -> transition -> settled faulted regime.
+                       A fault at t=0 teaches regime recognition, not detection.
+
+  SEVERITY >= 0.30     a fault too weak to have an effect is a MISLABELLED
+                       nominal episode - worse than no episode at all.
+
+  Consequence worth stating: episode-level 40% faulted, but SAMPLE-level only
+  ~15-20% of timesteps. The second number is what training actually sees, so the
+  manifest reports both.
+
+  Windows are FRACTIONS of the episode, so changing episode length rescales the
+  phases proportionally. All tunable under dataset.faults in the robot config.
+
+--------------------------------------------------------------------------------
+IDEA 2 - THE OPERATOR IS A SEEDED RNG
+--------------------------------------------------------------------------------
+
+  A fault's signature depends on what the rover was in the middle of. So the
+  mission is randomized too: goto (60%) / drive_straight (25%) / drive_turn
+  (15%), chained ONE AT A TIME, the next issued when the last completes.
+
+  Completion is decided on MEASURED POSE, not elapsed time -> a weakened wheel
+  that makes a leg take twice as long simply makes it take twice as long,
+  instead of the mission moving on without it.
+
+  Waypoints drawn inside an 8 m disc around the episode start, clamped to the
+  terrain, min 2.5 m per leg. Commands pass through the SAME tc_loss gate the
+  real uplink uses, so a comms fault is visible even with no ground station.
+
+  Rare HOUSEKEEPING between legs (~1 per episode): power a device off
+  (motor controller or camera) or stow the solar panel, then undo it after a
+  sampled hold - so a nominal episode also contains legitimate off-nominal
+  commands that a detector must not flag.
+
+--------------------------------------------------------------------------------
+IDEA 3 - OBSERVABLE vs ORACLE (the point of the whole exercise)
+--------------------------------------------------------------------------------
+
+  A detector may only be given what a real mission could see.
+
+  observable/   the downlink, and NOT a re-derivation of it - the recorder
+                drives the SAME PerseveranceTransmitter the ground station
+                drives, pointed at a file. 42 of the 58 downlinked
+                parameters (pose_ground_truth and the 15 /Rover/faults
+                parameters go to oracle); a parameter added to the rover
+                appears in the dataset with no code change.
+
+  oracle/       what no rover could know: the clean pre-corruption IMU reading
+                AND THE EXACT RESIDUAL, true battery Wh ahead of the
+                measurement noise, the real torque limit on every joint,
+                each wheel's damping factor, friction and sinkage, crater
+                geometry and signed rim distance (with --crater),
+                ground-truth health of every subsystem, and the label.
+
+  THE LABEL comes from the INJECTOR, not from the schedule: the schedule says
+  what was meant to happen, the injector says what did. A fault set another way
+  (startup flag, live operator) is still labelled correctly.
+
+  Three judgement calls are TAGGED rather than hidden:
+      pose_ground_truth.*        -> moved to oracle (it is the answer)
+      command_distance/heading   -> observable, tagged derived_from_truth
+      contact_force_*            -> observable, tagged derived_from_truth
+  manifest.json -> columns.notes lists them; drop for strict observability.
+
+--------------------------------------------------------------------------------
+IDEA 4 - A COMMS FAULT IS MISSING DATA, NOT A FLAG
+--------------------------------------------------------------------------------
+
+  tm_loss is drawn PER PARAMETER, so each column gets its own independent gaps
+  and a lost value is a genuinely EMPTY CELL (pandas NaN), never smoothed over.
+  tc_loss drops the command before the rover sees it, while the ground's log
+  still records it as sent - that DISCREPANCY is the observable fault.
+
+  Columns are registered BEFORE the drop gate. Otherwise a parameter dropped on
+  every tick of a heavily faulted episode would have no column at all and that
+  episode could not be concatenated with the others.
+
+--------------------------------------------------------------------------------
+IDEA 5 - UNATTENDED MEANS HANDLING THE BAD CASES
+--------------------------------------------------------------------------------
+
+  RESET IS THE HARD PART. Nothing in the subsystems stack had a reset: battery
+  charge, face temperatures, OBC uptime, GO/NOGO and every injected fault
+  persist for the life of the process. An episode inheriting the previous one's
+  flat battery would be LABELLED NOMINAL and look nothing like one.
+
+  FALLING OFF THE TERRAIN (seen for real: 13 of 20 episodes in run01). A
+  drive_straight goes wherever the rover faces, and waypoint clamping never
+  limited it, so the rover drove over the edge and free-fell ~25 s until the
+  500 m sanity check fired - labelled "physics diverged", with the fall still
+  in the rows. Now every straight is cut short where its heading leaves the
+  bounds (or becomes a goto), and the runner checks the pose against the height
+  map each step: outside the DEM or 0.5 m below the ground abandons the episode
+  as "aborted: fell off terrain" and discards the last 3 s (tipping over the
+  edge) - rows, commands, fault events and frames. meta.json records the cut.
+
+  SOLVER DIVERGENCE. A non-finite pose or one beyond 500 m still abandons the
+  episode as "aborted: physics diverged", KEEPS the rows already recorded, and
+  gives the next reset extra settle steps. If the rover never comes back, the
+  run STOPS and says so.
+
+  RE-RUN SAFETY. Each episode directory is cleared as it is written, or a
+  shorter re-run leaves the previous run's frames sitting in images/, indexed
+  nowhere and looking exactly like this episode's data. Consumers iterate
+  manifest.json -> episode_index, never the directory listing.
+
+  DISK GUARD. Refuses to start an episode below --min-free-gb, stops cleanly at
+  --max-disk-gb. ~20 MB/episode with frames, ~2 GB per 100 episodes.
+
+--------------------------------------------------------------------------------
+NUMBERS FOR THE SLIDE
+--------------------------------------------------------------------------------
+
+    episode            600 s = 18000 physics steps @ 33 ms
+    telemetry          1 Hz, 42 observable parameters -> ~600 rows/episode
+    nav-cam            0.2 Hz, 320x240 RGBA -> ~120 frames/episode
+    fault kinds        10 (wheel torque/stuck/slip/sink, steer torque/stuck,
+                           imu, camera, battery, comms)
+                       + crater episodes with --crater (not a fault: the rover
+                         is intact but trapped)
+    class mix          60 / 28 / 9 / 3 %  (nominal/single/concurrent/sequential)
+    faulted timesteps  ~15-20%
+    disk               ~20 MB/episode, ~2 GB per 100
+    format             CSV + JSONL (no pyarrow/h5py in the Isaac Sim python)
+
+    REPRODUCIBILITY, honestly stated: one --dataset-seed fixes every episode
+    seed, schedule and waypoint. PhysX determinism is NOT configured, so
+    episodes replay IN DISTRIBUTION rather than bit-exactly - and the manifest
+    says so rather than leaving it to be discovered.
+
+--------------------------------------------------------------------------------
+CLOSING LINE
+--------------------------------------------------------------------------------
+
+    Press one button, walk away, come back to a labelled fault-detection
+    dataset whose observable half is the real downlink and whose labels come
+    from the thing that actually broke the rover.

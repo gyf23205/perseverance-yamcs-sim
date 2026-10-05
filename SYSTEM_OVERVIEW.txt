@@ -1,0 +1,193 @@
+================================================================================
+SYSTEM OVERVIEW - Perseverance rover in OmniLRS / Isaac Sim
+One-slide brief: feed this to a slide generator
+================================================================================
+
+TITLE: A lunar rover you command like a real one
+
+ONE-LINE PITCH
+    A Perseverance-class six-wheel rover simulated in NVIDIA Isaac Sim (OmniLRS
+    lunar environments), commanded from a Yamcs ground station over a low-rate
+    link, with onboard closed-loop driving, simulated subsystems, on-demand
+    fault injection, and a self-labelling dataset generator.
+
+--------------------------------------------------------------------------------
+STRUCTURE - two containers, one loopback link
+--------------------------------------------------------------------------------
+
+   EARTH - Yamcs container               ROVER - Isaac Sim container
+  +---------------------------+         +------------------------------------+
+  | Web UI :8090              |  TC     | CommandsHandler (UDP :10025)       |
+  |  operator sends GOALS  ---+-- UDP ->|   -> PerseveranceCommander         |
+  |                           |         |   -> DriveController (30 Hz loop)  |
+  | Mission database (MDB)    |         |   -> Ackermann model -> joints     |
+  |                           |  TM     |                                    |
+  | Parameter archive      <--+-- 1 Hz -| PerseveranceTransmitter            |
+  | Image bucket (nav-cam) <--+-- 0.2Hz-| Camera handler                     |
+  +---------------------------+         |                                    |
+                                        | Subsystems: power, thermal,        |
+                                        |   radio, OBC                       |
+                                        | FaultInjector (sim backdoor)       |
+                                        | Dataset generator (optional)       |
+                                        +------------------------------------+
+
+  THE CENTRAL CONSTRAINT
+    Ground link 1 Hz  vs  wheel control 30 Hz
+    => low-level control cannot live on the ground
+    => the ground sends goals ("go to x,y"); the rover works out wheel motion
+
+--------------------------------------------------------------------------------
+THE ROVER - physical model
+--------------------------------------------------------------------------------
+
+    Asset ............ rover_with_sensors.usd, scale 0.35 (~0.8 m x 0.8 m)
+    Mass ............. ~1025 kg as authored in the USD
+    Mobility ......... 6 wheels, rocker-bogie layout
+                       6 drive joints   velocity control
+                       4 steer joints   position control (front + rear corners)
+                       2 mid wheels     fixed
+    Steering ......... four-corner Ackermann - wheels roll through turns
+                       instead of skidding; point turns in place
+    Wheel radius ..... 0.092 m     Track ... 0.829 m     Max steer ... 75 deg
+    Environment ...... lunar gravity 1.62 m/s^2, physics step 33 ms (~30 Hz)
+    Terrains ......... Lunaryard 20/40/80 m (procedural craters, live sun),
+                       Lunalab 10 x 6.5 m (indoor), South Pole large-scale DEM
+                       (streamed), optional real-time wheel-track deformation
+
+--------------------------------------------------------------------------------
+SENSORS
+--------------------------------------------------------------------------------
+
+  Physical sensors (Isaac Sim, read from the physics/render engine)
+    IMU .................... on body: accelerometer, gyroscope, orientation
+    Nav camera ............. body/nav_cam, 320x240 downlink (1440x1080 avail.),
+                             one frame every 5 s to a Yamcs bucket
+    Forward camera ......... body/fwd_cam, viewport view for the operator
+    Contact sensors ........ one per wheel -> 6 contact forces
+    Drive encoders ......... 6 wheel joint positions/velocities
+    Drive effort ........... 6 joint torques measured by the physics solver
+    Steer encoders ......... 4 corner angles
+    Pose ................... base-link ground-truth pose (used by the controller)
+    (RTX LiDAR is authored in the USD but not read by the pipeline)
+
+  Simulated subsystems (Python models, not USD)
+    Power .................. 60 Wh battery, 30 W solar panel (deploy/stow),
+                             sun angle from live stellar engine; reports
+                             charge, voltage, net power, currents per device
+    Thermal ................ 6 box faces heated by sun view factor
+    Radio .................. RSSI vs distance to a fixed relay, with noise
+    OBC .................... state, CPU / RAM / disk usage, uptime
+    Devices ................ OBC, motor controller, camera, radio, EPS, IMU -
+                             each with power state and health state
+
+--------------------------------------------------------------------------------
+SOFTWARE MODULES
+--------------------------------------------------------------------------------
+
+  Launch scripts (my_files/src)
+    run_perseverance.py ............. Lunaryard / Lunalab; interactive, ground
+                                      control, calibration, dataset mode
+    run_largescale_perseverance.py .. South Pole streamed DEM
+    add_sensors.py .................. authors IMU/camera/LiDAR/contact onto USD
+    visualize_dataset.py ............ plots for a generated dataset
+
+  OmniLRS mission package (src/mission_specific/perseverance)
+    control/   ackermann_model ...... wheel angles + speeds from (v, curvature)
+               drive_controller ..... closed-loop goals, interlocks, status
+    tmtc/      perseverance_controller  wires rover to Yamcs
+               perseverance_commander . telecommand handlers
+               perseverance_transmitter telemetry, one method per group
+               perseverance_camera_handler  nav-cam frames to the bucket
+    subsystems/ perseverance_subsystems_handler  power/thermal/radio/OBC sizing
+    faults/    fault_injector ....... queue-then-apply fault injection
+    dataset/   fault_scheduler, mission_scripter, episode_runner,
+               recorder, crater
+
+  Ground station (OmniLRS/yamcs_server)
+    Yamcs in Docker, MDB cfg/mdb/perseverance.xml, UDP TC link,
+    parameter archive in a persistent Docker volume
+
+  Configuration
+    cfg/robot/perseverance.yaml ................ geometry, control gains,
+                                                 fault references, dataset mix
+    cfg/controller/perseverance-controller.yaml  TM/TC paths and rates
+
+--------------------------------------------------------------------------------
+COMMANDS AND TELEMETRY
+--------------------------------------------------------------------------------
+
+  7 flight commands (goals, not wheel speeds)
+    drive_straight (speed, distance)    drive_turn (rate, angle)
+    goto (x, y)                         stop
+    go_nogo (GO / NOGO)                 power_electronics (device, ON/OFF)
+    deploy_solar_panel (DEPLOYED / STOWED)
+
+  11 fault commands (10 inject + clear_faults) - a simulation backdoor
+
+  63 telemetry parameters (58 at 1 Hz + 5 nav-cam image metadata), grouped:
+    Pose ....... ground-truth pose, IMU accel / gyro / orientation
+    Mobility ... drive encoders, drive effort, steer encoders, contact forces
+    Power ...... charge, voltage, net power, currents in/out, per-device draw
+    Thermal .... 6 face temperatures      Comms ... radio RSSI
+    State ...... OBC state/metrics, go/nogo, solar panel state
+    Command .... active command, status, distance remaining, heading error
+    Faults ..... injected faults and ground-truth health (kept on /Rover/faults)
+
+  Command lifecycle:  IDLE -> EXECUTING -> COMPLETE | REJECTED | ABORTED
+  Safety interlocks, re-checked every step: GO, motor controller ON + healthy
+  Manual keyboard (W/A/S/D) overrides and aborts any running command
+
+--------------------------------------------------------------------------------
+ONBOARD CONTROL LOOP (every physics step)
+--------------------------------------------------------------------------------
+
+    1. check interlocks
+    2. read pose -> heading
+    3. compute distance / heading error (measured, not dead-reckoned)
+    4. Ackermann solve -> 4 steer angles + 6 wheel speeds
+    5. write joint targets
+    Stops within 0.15 m (goto), 0.05 m (straight), 2 deg (heading)
+
+--------------------------------------------------------------------------------
+FAULT INJECTION - breaking the rover on purpose
+--------------------------------------------------------------------------------
+
+  10 fault types, severity 0.0 (healthy) -> 1.0 (dead), from Yamcs or --fault
+    Actuation ... wheel torque, wheel stuck, steer torque, steer stuck
+    Traction .... wheel slip (friction), wheel sink (soft soil)
+    Sensing ..... IMU bias / noise, camera frame loss / noise
+    Power ....... parasitic battery load
+    Link ........ telemetry loss, telecommand loss
+  The controller is never told - it must fight the fault as tracking error.
+
+--------------------------------------------------------------------------------
+DATASET GENERATION - the simulator labels its own data
+--------------------------------------------------------------------------------
+
+    Headless, no ground station. Seeded random operator drives randomized
+    600 s episodes; faults (and optional steep-crater traps) appear on a seeded
+    schedule. Class mix 60% nominal / 28% single / 9% concurrent / 3% sequential.
+    Each episode splits into:
+      observable/  what the ground could see - real downlink CSV, commands,
+                   nav-cam frames
+      oracle/      what only the simulator knows - clean sensors, true pose,
+                   true health, fault labels
+
+--------------------------------------------------------------------------------
+KEY NUMBERS FOR THE SLIDE
+--------------------------------------------------------------------------------
+
+    Control loop ........ 30 Hz        Telemetry downlink .. 1 Hz, 58 params
+    Nav-cam downlink .... every 5 s    Commands ............ 7 flight + 11 fault
+    Fault types ......... 10           Wheels .............. 6 (4 steerable)
+    Battery ............. 60 Wh        Solar panel ......... 30 W
+    Gravity ............. 1.62 m/s^2   Rover scale ......... 0.35
+
+--------------------------------------------------------------------------------
+CLOSING LINE
+--------------------------------------------------------------------------------
+
+    Goals go down, telemetry comes up, the rover closes its own loop - and
+    every fault we inject becomes a labelled example of what going wrong looks
+    like from the ground.
+================================================================================

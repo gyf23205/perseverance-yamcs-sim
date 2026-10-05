@@ -92,10 +92,88 @@ parser.add_argument("--calibrate", action="store_true",
                          "steer_sign) empirically, print them, and exit. Run this once and copy "
                          "the values into cfg/robot/perseverance.yaml before trusting commanded "
                          "motion.")
+parser.add_argument("--fault", action="append", default=[], metavar="KIND:TARGET:MAGNITUDE",
+                    help="Inject a fault at startup, repeatable. Severity always runs healthy (0) "
+                         "to dead (1). "
+                         "wheel_torque:<wheel|ALL>:<severity>, "
+                         "wheel_stuck:<wheel|ALL>:<severity>, "
+                         "wheel_slip:<wheel|ALL>:<severity>, "
+                         "wheel_sink:<wheel|ALL>:<severity>, "
+                         "steer_torque:<corner|ALL>:<severity>, "
+                         "steer_stuck:<corner|ALL>:<angle deg>, "
+                         "imu:<bias>:<noise>, camera:<loss>:<noise>, battery:<severity>, "
+                         "comms:<tm_loss>:<tc_loss>. Same effect as the /Rover/faults commands, "
+                         "but reproducible and usable without a ground station. "
+                         "With --dataset-out, every episode records exactly these faults instead "
+                         "of a random schedule; append @<seconds> to set the onset "
+                         "(e.g. wheel_slip:front_left:0.8@300), else it is drawn from "
+                         "dataset.faults.onset_window.")
+parser.add_argument("--fault-seed", type=int, default=0,
+                    help="Seed for injected sensor noise and packet loss. Fixed by default so a "
+                         "faulted run replays identically.")
+parser.add_argument("--dataset-out", metavar="DIR",
+                    help="Generate a labelled fault-detection dataset into DIR instead of running "
+                         "interactively. The rover drives itself through randomized episodes with "
+                         "randomly scheduled faults, and telemetry, commands and nav-cam frames "
+                         "are recorded split into observable/ and oracle/. Put DIR under my_files/ "
+                         "so it survives the container.")
+parser.add_argument("--episodes", type=int, default=10,
+                    help="How many episodes to record with --dataset-out.")
+parser.add_argument("--render-every-step", action="store_true",
+                    help="Render every physics step of a dataset episode, as before. By default only "
+                         "the few steps before each nav-cam capture render (none with --no-images), "
+                         "which is much faster; use this to check frames against it or to watch the GUI.")
+parser.add_argument("--render-warmup-frames", type=int, default=None, metavar="N",
+                    help="How many times the renderer is warmed up at each nav-cam capture in a dataset "
+                         "run, overriding dataset.episode.render_warmup_frames (8). These renders do not "
+                         "step physics, so they cost time but never move the rover.")
+parser.add_argument("--episode-steps", type=int, default=None,
+                    help="Physics steps per episode, overriding dataset.episode.episode_steps in "
+                         "the robot config (18000 there, which is 600 s at 33 ms).")
+parser.add_argument("--dataset-seed", type=int, default=0,
+                    help="Seed for the whole dataset run: episode seeds, fault schedules and "
+                         "mission waypoints all derive from it.")
+parser.add_argument("--randomize-terrain", action="store_true",
+                    help="Regenerate the DEM between episodes as well as the rocks. Slower, and "
+                         "occasionally leaves the rover intersecting the new terrain.")
+parser.add_argument("--crater", action="store_true",
+                    help="Add the steep-crater scenario. With --dataset-out, crater episodes join the "
+                         "mix at dataset.faults.class_weights.crater, each with its own random crater, "
+                         "spawn and outcome (trapped, avoid or skirt). Without it, one random crater is "
+                         "cut into the terrain near the spawn point for driving in by hand.")
+parser.add_argument("--landing-hold", type=float, default=3.0, metavar="SECONDS",
+                    help="Simulation seconds to hold the wheels still after the rover spawns, so it has "
+                         "landed and settled before any keyboard input or ground command moves it. "
+                         "Commands sent in the meantime wait and start when the hold ends.")
+parser.add_argument("--estimator-dump", metavar="DIR", default=None,
+                    help="Record the navigation filter's raw 30 Hz inputs, beside ground-truth pose, to "
+                         "DIR/<episode>.npz for fitting the estimator config offline "
+                         "(scripts/fit_nav_estimator.py). Truth is recorded, never fed to the filter.")
+parser.add_argument("--gravity", type=float, default=1.62, metavar="M_PER_S2",
+                    help="Gravity magnitude, pointing down -Z (default 1.62, the Moon). Matches "
+                         "cfg/physics/default_physics.yaml; without it Isaac Sim uses Earth's 9.81.")
+parser.add_argument("--spawn-clearance", type=float, default=0.15, metavar="METRES",
+                    help="Without --spawn-pos, the rover is placed this far above the highest ground "
+                         "under the terrain centre instead of 3 m up, where a drop could flip it.")
+parser.add_argument("--spawn-debug", type=float, default=0.0, metavar="SECONDS",
+                    help="Print the rover's motion every 0.5 s for this many simulation seconds after "
+                         "spawn: position, speed, roll/pitch, wheel spin and command status. Tells a "
+                         "rover being driven (wheels spinning) from one sliding or tipping.")
+parser.add_argument("--crater-seed", type=int, default=0,
+                    help="Seed for the interactive --crater placement and shape.")
+parser.add_argument("--no-images", action="store_true",
+                    help="Skip the nav-cam frames in a dataset run. Telemetry-only episodes are a "
+                         "few MB each instead of tens of MB.")
+parser.add_argument("--max-disk-gb", type=float, default=None,
+                    help="Stop the dataset run cleanly once it has written this many GB.")
+parser.add_argument("--min-free-gb", type=float, default=5.0,
+                    help="Refuse to start another episode below this much free disk.")
 args, _extra = parser.parse_known_args()
 
 # ── Resolve spawn position ────────────────────────────────────────────────────
 lab_len, lab_wid, _res, _is_yard, _cz, _bz = _ENV_PARAMS[args.env]
+# Whether the spawn height should come from the terrain once it is built; see "Spawn height" below.
+_spawn_on_ground = args.spawn_pos is None
 if args.spawn_pos is None:
     args.spawn_pos = [lab_len / 2, lab_wid / 2, 3.0]
 else:
@@ -160,6 +238,10 @@ from src.mission_specific.perseverance.control.ackermann_model import (
     AckermannModel, RoverGeometry as AckermannGeometry,
 )
 from src.mission_specific.perseverance.control.drive_controller import PerseveranceDriveController
+
+# OmniLRS — fault injection. Not rover software: a simulation backdoor that breaks actuators on
+# command so the closed loop can be watched compensating.
+from src.mission_specific.perseverance.faults.fault_injector import FaultInjector
 
 import yaml
 
@@ -369,6 +451,18 @@ def _make_terrain_manager(length, width, res, is_yard, cz, bz, root, tex, dems):
         resolution=res,
     )
 
+def _set_gravity(world) -> None:
+    """
+    Lunar gravity, before any physics step.
+
+    World() creates the physics scene with Isaac Sim's Earth default. OmniLRS's own simulation manager
+    applies cfg/physics/default_physics.yaml (-1.62) instead, but these launch scripts build World
+    directly, so without this the rover weighs six times what every sizing in the robot config assumes.
+    """
+    world.get_physics_context().set_gravity(-abs(args.gravity))
+    print(f"[sim] Gravity: {abs(args.gravity):.2f} m/s^2", flush=True)
+
+
 # ── Build environment controller ──────────────────────────────────────────────
 print(f"[sim] Setting up Isaac Sim world …")
 
@@ -387,6 +481,7 @@ if args.env in ("lunaryard_20m", "lunaryard_40m", "lunaryard_80m"):
     )
     set_moon_env_name(env_name)
     world = World(stage_units_in_meters=1.0, physics_dt=PHYSICS_DT, rendering_dt=PHYSICS_DT)
+    _set_gravity(world)
 
     print("[sim] Warm-up pass 1 (physics init) …")
     for _ in range(100):
@@ -420,6 +515,7 @@ elif args.env == "lunalab":
     )
     set_moon_env_name(env_name)
     world = World(stage_units_in_meters=1.0, physics_dt=PHYSICS_DT, rendering_dt=PHYSICS_DT)
+    _set_gravity(world)
 
     print("[sim] Warm-up pass 1 (physics init) …")
     for _ in range(100):
@@ -449,7 +545,10 @@ _robot_settings["parameters"]["usd_path"]       = args.rover
 _robot_settings["parameters"]["scale"]          = args.scale
 _robot_settings["parameters"]["pose"]["position"] = list(args.spawn_pos)
 _robot_settings["parameters"]["wheel_joints"]   = {"left": args.left_joints, "right": args.right_joints}
-if args.yamcs:
+# The controller config carries the yamcs_tmtc block, which is where the parameter paths live. A
+# dataset run needs those too - it drives the same transmitter, just into a file rather than a
+# ground station - so it is loaded for both.
+if args.yamcs or args.dataset_out:
     with open(args.controller_cfg) as _f:
         _robot_settings.update(yaml.safe_load(_f)["robots_settings"])
 
@@ -458,9 +557,49 @@ stage = get_current_stage()
 # also why cfg/robot/perseverance.yaml sets robots_root to /World.
 stage.DefinePrim("/World", "Xform")
 
+# ── Crater scenario setup ─────────────────────────────────────────────────────
+# Terrain edits rebuild the collider, so they happen here, before the rover exists. A dataset run
+# stamps a fresh crater per episode instead (EpisodeRunner); this is the one-crater interactive demo.
+from src.mission_specific.perseverance.dataset import crater as crater_module
+
+_crater_cfg = crater_module.merged_config({
+    **_robot_settings["parameters"].get("dataset", {}).get("crater", {}),
+    "bounds": [[0.0, lab_len], [0.0, lab_wid]],
+    "resolution": _res,
+})
+if args.crater and not args.dataset_out:
+    import random as _random
+    _crater_rng = _random.Random(args.crater_seed)
+    _crater_spec = crater_module.place_ahead_of(_crater_rng, args.spawn_pos[:2], _crater_cfg)
+    _dem, _mask = crater_module.stamp(*EC.get_terrain(), _crater_spec, _res)
+    EC.set_terrain(_dem, _mask)
+    EC.randomize_rocks(8)
+    print(f"[crater] centre ({_crater_spec.center_x:.2f}, {_crater_spec.center_y:.2f})  "
+          f"rim radius {_crater_spec.outer_radius:.2f} m  depth {_crater_spec.depth:.2f} m  "
+          f"wall {_crater_spec.wall_slope_deg:.1f} deg", flush=True)
+    _dash = crater_module.dash_target(_crater_spec, args.spawn_pos[:2])
+    print(f"[crater] to drive in: goto x={_dash[0]:.2f} y={_dash[1]:.2f}", flush=True)
+
+# ── Spawn height ──────────────────────────────────────────────────────────────
+# Just above the ground rather than 3 m up. Found while the scene still ran at Earth gravity, where a
+# 3 m drop hit at ~7 m/s and often put the rover on its back; a low spawn is gentler at any gravity, and
+# the rover starts driving sooner. The base link's origin sits
+# at the bottom of the wheels, so ground height plus a small clearance is a gentle drop. An explicit
+# --spawn-pos is left exactly as given.
+if _spawn_on_ground and hasattr(EC, "get_terrain"):
+    _ground = crater_module.ground_height(EC.get_terrain()[0], _res, args.spawn_pos[0], args.spawn_pos[1], 0.75)
+    args.spawn_pos[2] = _ground + args.spawn_clearance
+    _robot_settings["parameters"]["pose"]["position"] = list(args.spawn_pos)
+    print(f"[sim] Spawn height: ground {_ground:.3f} m + clearance {args.spawn_clearance:.2f} m "
+          f"-> z = {args.spawn_pos[2]:.3f} m", flush=True)
+
 RM = RobotManager(_robot_settings, mode=SimulatorMode.YAMCS)
 RM.preload_robot(world)
 ROVER_PRIM = RM.robot.robot_path
+# Before any physics step: the wheel slip and sink faults need their per-wheel materials and collider
+# offsets authored while PhysX still
+# has to parse the rover. Later faults only change values, which is safe mid-run.
+FaultInjector.prepare_robot(RM.robot, _robot_settings["parameters"].get("fault_injection", {}))
 
 rover_prim = stage.GetPrimAtPath(ROVER_PRIM)
 children = [c.GetName() for c in rover_prim.GetChildren()]
@@ -530,6 +669,31 @@ drive_controller = PerseveranceDriveController(
     RM.robot, RM.robot_RG, AckermannModel(_geometry), _drive_cfg
 )
 
+# ── Fault injection ───────────────────────────────────────────────────────────
+# Sits below the controller, at the joints, which is the whole point: the controller does not know
+# a fault happened and has to discover it as a tracking error, exactly as it would on a real rover.
+_fault_cfg = dict(_robot_settings["parameters"].get("fault_injection", {}))
+fault_injector = FaultInjector(RM.robot, _fault_cfg, seed=args.fault_seed)
+
+# ── Onboard navigation filter ─────────────────────────────────────────────────
+# EKF on the rover's own sensors (imu, joint rates and efforts, steer angles, commanded rates), ticked
+# after the faults every step. Its per-sensor residuals are downlinked under /Rover/estimator.
+from src.mission_specific.perseverance.estimation.nav_filter import NavFilter
+
+_estimator_cfg = dict(_robot_settings["parameters"].get("estimator", {}))
+if args.estimator_dump:
+    _estimator_cfg["calibration_dump"] = args.estimator_dump
+nav_filter = None
+if _estimator_cfg.get("enabled", True):
+    nav_filter = NavFilter(
+        RM.robot, drive_controller, _geometry, _estimator_cfg,
+        steer_sign=drive_controller.steer_sign, gravity=abs(args.gravity),
+        # Recorded beside the sensor data for offline fitting only; the filter never reads it.
+        truth_fn=RM.robot_RG.get_pose_of_base_link if args.estimator_dump else None,
+    )
+    print(f"[nav] Navigation filter on"
+          f"{' - calibration dump to ' + args.estimator_dump if args.estimator_dump else ''}", flush=True)
+
 # ── Calibration ───────────────────────────────────────────────────────────────
 # Two sign conventions cannot be read off the usd. It names its front wheels at -y while the
 # camera convention calls +y forward, and the steer joint sign depends on how the joint frames
@@ -569,7 +733,7 @@ if args.calibrate:
     forward_sign = 1.0 if projection >= 0 else -1.0
     print(f"[cal] moved {_np.linalg.norm(displacement):.3f} m, projection onto body +Y = {projection:+.4f}")
     print(f"[cal] forward_axis_sign: {forward_sign:+.1f}"
-          f"   ({'body +Y is forward' if forward_sign > 0 else 'body +Y points AFT'})")
+          f"   ({'body +Y is forward' if forward_sign > 0 else 'body +Y points BACKWARD'})")
     if _np.linalg.norm(displacement) < 0.01:
         print("[cal] WARNING: rover barely moved — result is unreliable. Check the drive joints.")
 
@@ -788,12 +952,105 @@ if args.yamcs:
         RM.robot_RG,
         RM.robot,
         drive_controller,
+        fault_injector,
+        nav_filter=nav_filter,
     )
     TMTC.setup_command_callbacks(RM.RM_conf.yamcs_tmtc["commands"])
     TMTC.start_streaming_data()
     print(f"[gs] Downlink every {RM.RM_conf.yamcs_tmtc['intervals']['robot_stats']}s; "
           f"listening for commands on "
           f"{_instance_conf['tc_receive_address']}:{_instance_conf['tc_receive_port']}")
+
+# ── Startup faults ────────────────────────────────────────────────────────────
+# Queued here rather than next to the injector so --calibrate, which exits earlier, always measures
+# a healthy rover. These land on the first fault_injector.update() in the loop below, like any
+# fault arriving from the ground - there is only one code path that touches the stage.
+# In dataset mode the specs become each episode's schedule instead (EpisodeRunner), since every
+# episode starts from a cleared injector.
+if not args.dataset_out:
+    for _spec in args.fault:
+        fault_injector.apply_spec(_spec)
+
+# ── Dataset generation ────────────────────────────────────────────────────────
+# An early branch like --calibrate: it replaces the interactive loop rather than running inside it,
+# because an episode needs the rover to itself - no keyboard, no operator, and a reset between runs.
+if args.dataset_out:
+    from src.mission_specific.perseverance.dataset.episode_runner import EpisodeRunner
+    from src.mission_specific.perseverance.dataset.recorder import DatasetRecorder
+    from src.mission_specific.perseverance.tmtc.perseverance_transmitter import PerseveranceTransmitter
+
+    if args.fault:
+        print(f"[dataset] fixed fault schedule from --fault: {args.fault}", flush=True)
+        if args.crater:
+            print("[dataset] --crater with --fault: no crater episodes, the schedule is fixed", flush=True)
+
+    _dataset_cfg = dict(_robot_settings["parameters"].get("dataset", {}))
+
+    # The flag wins over the config, but only when it was actually given - spreading the config
+    # after the flag would silently ignore it, which is exactly the bug this ordering fixes.
+    _episode_cfg = dict(_dataset_cfg.get("episode", {}))
+    if args.episode_steps is not None:
+        _episode_cfg["episode_steps"] = args.episode_steps
+    if args.render_every_step:
+        _episode_cfg["render_every_step"] = True
+    if args.render_warmup_frames is not None:
+        _episode_cfg["render_warmup_frames"] = args.render_warmup_frames
+
+    # Keep waypoints and straight drives inside the terrain: a rover that drives off the edge falls,
+    # and the episode is lost.
+    _mission_cfg = dict(_dataset_cfg.get("mission", {}))
+    _mission_cfg.setdefault("bounds", [[2.0, lab_len - 2.0], [2.0, lab_wid - 2.0]])
+
+    def _sun_position():
+        if has_stellar and getattr(EC, "enable_stellar_engine", False):
+            return EC.SE.get_local_position("sun")
+        return _SUN_FALLBACK
+
+    _recorder = DatasetRecorder(
+        args.dataset_out,
+        fault_injector,
+        robot=RM.robot,
+        subsystems=subsystems,
+        record_images=not args.no_images,
+        min_free_gb=args.min_free_gb,
+        max_disk_gb=args.max_disk_gb,
+    )
+    # The observable stream is the real downlink surface: the same transmitter the ground station
+    # drives, pointed at the recorder instead of at Yamcs.
+    _recorder._transmitter = PerseveranceTransmitter(
+        _recorder.transmit, None, RM.robot, RM.robot_RG, RM.robot.robot_name.replace("/", ""),
+        RM.RM_conf.yamcs_tmtc["parameters"], drive_controller=drive_controller,
+        fault_injector=fault_injector, nav_filter=nav_filter,
+    )
+
+    _runner = EpisodeRunner(
+        world, RM, drive_controller, fault_injector, _recorder,
+        sun_fn=_sun_position,
+        physics_dt=PHYSICS_DT,
+        spawn=tuple(_robot_settings["parameters"]["pose"]["position"]),
+        episodes=args.episodes,
+        seed=args.dataset_seed,
+        config=_episode_cfg,
+        scheduler_config=_dataset_cfg.get("faults"),
+        mission_config=_mission_cfg,
+        environment=EC,
+        randomize_terrain=args.randomize_terrain,
+        camera_resolution=_dataset_cfg.get("camera_resolution", "low"),
+        record_images=not args.no_images,
+        is_running=simulation_app.is_running,
+        crater_config=_crater_cfg if args.crater else None,
+        terrain_resolution=_res,
+        fault_specs=args.fault,
+        nav_filter=nav_filter,
+    )
+
+    omni.timeline.get_timeline_interface().play()
+    _runner.run()
+
+    world.stop()
+    omni.timeline.get_timeline_interface().stop()
+    simulation_app.close()
+    sys.exit(0)
 
 # ── Simulation loop ───────────────────────────────────────────────────────────
 timeline = omni.timeline.get_timeline_interface()
@@ -802,6 +1059,12 @@ timeline.play()
 rate        = Rate(dt=PHYSICS_DT)
 xform_cache = UsdGeom.XformCache()
 step        = 0
+# Physics steps taken while playing, for the landing hold below.
+_played_steps = 0
+_landing_hold_steps = int(math.ceil(max(0.0, args.landing_hold) / PHYSICS_DT))
+if _landing_hold_steps:
+    print(f"[sim] Landing hold: wheels held still for {args.landing_hold:.1f} s of simulation "
+          f"while the rover lands", flush=True)
 
 print("[sim] Running … (Ctrl-C or close the window to quit)")
 while simulation_app.is_running():
@@ -829,8 +1092,40 @@ while simulation_app.is_running():
         # Both go through the same Ackermann controller, so they can never fight over the joint
         # targets. Real keyboard input takes over and aborts a command in flight; an idle keyboard
         # yields, letting the command keep driving.
+        # The rover spawns 3 m up and drops. Driving it before it has landed and settled - a goto sent
+        # straight away, or a key held at startup - can flip it, so neither the keyboard nor a ground
+        # command moves the wheels until the hold is over. A command that arrives during the hold is
+        # accepted and simply starts driving when it ends.
+        _played_steps += 1
+        holding = _played_steps <= _landing_hold_steps
+
+        if args.spawn_debug > 0 and _played_steps <= args.spawn_debug / PHYSICS_DT and _played_steps % 15 == 1:
+            _t = _played_steps * PHYSICS_DT
+            # The base link's pose, as the drive controller reads it. The rover's root prim does not
+            # move - the articulated bodies under it do - so the xform cache pose above is useless here.
+            _bp, _bq = RM.robot_RG.get_pose_of_base_link()
+            _p = tuple(float(v) for v in _bp)
+            _w, _x, _y, _z = (float(v) for v in _bq)
+            _prev = globals().get("_debug_prev")
+            _speed = 0.0 if _prev is None else math.dist(_p, _prev[1]) / max(_t - _prev[0], 1e-6)
+            globals()["_debug_prev"] = (_t, _p)
+            _roll = math.degrees(math.atan2(2 * (_w * _x + _y * _z), 1 - 2 * (_x * _x + _y * _y)))
+            _pitch = math.degrees(math.asin(max(-1.0, min(1.0, 2 * (_w * _y - _z * _x)))))
+            try:
+                RM.robot._init_named_dofs()
+                _spin = {name: round(float(RM.robot.dc.get_dof_velocity(dof)), 2)
+                         for name, dof in RM.robot._wheel_dofs.items()}
+            except Exception as _exc:
+                _spin = f"unavailable ({_exc})"
+            print(f"[spawn-debug] t={_t:5.2f}s hold={'on ' if holding else 'off'} "
+                  f"pos=({_p[0]:.2f}, {_p[1]:.2f}, {_p[2]:.2f}) speed={_speed:.3f} m/s "
+                  f"roll={_roll:6.1f} pitch={_pitch:6.1f} status={drive_controller.status.name} "
+                  f"wheel_rad_s={_spin}", flush=True)
+        if _played_steps == _landing_hold_steps + 1 and _landing_hold_steps:
+            print("[sim] Landing hold over: the rover may move", flush=True)
+
         manual_active = False
-        if keyboard_enabled:
+        if keyboard_enabled and not holding:
             fwd  = input_iface.get_keyboard_value(keyboard, carb.input.KeyboardInput.W)
             back = input_iface.get_keyboard_value(keyboard, carb.input.KeyboardInput.S)
             rght = input_iface.get_keyboard_value(keyboard, carb.input.KeyboardInput.D)
@@ -845,8 +1140,21 @@ while simulation_app.is_running():
 
             manual_active = drive_controller.manual(speed, curvature, point_turn_rate)
 
-        if not manual_active:
+        if not manual_active and not holding:
             drive_controller.update()
+
+        # Apply any fault the ground asked for. Has to happen here, on the simulation thread: the
+        # commands arrive on the telecommand listener thread and end in a usd write, which deadlocks
+        # Kit if done there.
+        fault_injector.update()
+
+        # Navigation filter. Held at reset while the rover lands, so its local origin and heading are
+        # the pose the rover settled at rather than a point in mid-drop.
+        if nav_filter is not None:
+            if holding:
+                nav_filter.reset()
+            else:
+                nav_filter.update(PHYSICS_DT)
 
         # Subsystems step. The sun position is pushed in so the power and thermal models track the
         # live stellar engine rather than the static fallback. OBC state is set by the drive
@@ -950,4 +1258,8 @@ if TMTC is not None:
     TMTC.shutdown()
 world.stop()
 timeline.stop()
+if nav_filter is not None:
+    _dump = nav_filter.save_dump("interactive")
+    if _dump:
+        print(f"[nav] calibration dump: {_dump}", flush=True)
 simulation_app.close()
