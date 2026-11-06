@@ -107,7 +107,7 @@ parser.add_argument("--fault", action="append", default=[], metavar="KIND:TARGET
                          "With --dataset-out, every episode records exactly these faults instead "
                          "of a random schedule; append @<seconds> to set the onset "
                          "(e.g. wheel_slip:front_left:0.8@300), else it is drawn from "
-                         "dataset.faults.onset_window.")
+                         "dataset.faults.onset_min_s and onset_max.")
 parser.add_argument("--fault-seed", type=int, default=0,
                     help="Seed for injected sensor noise and packet loss. Fixed by default so a "
                          "faulted run replays identically.")

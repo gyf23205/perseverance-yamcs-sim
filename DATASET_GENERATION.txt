@@ -38,13 +38,15 @@ THE PIPELINE - four modules, one loop
    _reset_episode()                |   PER-STEP LOOP (~33 ms)      |
    - clear all faults              |  1. pop due fault events      |
    - teleport + random heading     |     -> injector.inject_*()    |
-   - battery -> 100%               |  2. scripter issues next cmd  |
-   - face temps -> initial         |  3. drive_controller.update() |
-   - OBC uptime restart            |  4. fault_injector.update()   |
+   - battery -> random 50-100%     |  2. scripter issues next cmd  |
+   - face temps <- heading history |  3. drive_controller.update() |
+   - OBC uptime -> random 0.5h-3d  |  4. fault_injector.update()   |
    - GO/NOGO -> GO                 |  5. power + thermal integrate |
    - randomize rocks (/terrain)    |  6. downlink tick   @ 1 Hz    |
    - stamp/remove crater (--crater)|  7. nav-cam frame   @ 0.2 Hz  |
    - settle 30 steps               |                               |
+   - filter origin, counter random |  from t = -preroll; rows and  |
+   - pre-roll 0-60 s, unrecorded   |  frames only from t = 0       |
                                    +-------------------------------+
                                                 |
                                                 v
@@ -74,12 +76,13 @@ IDEA 1 - THE SCHEDULE IS SAMPLED, NOT SCRIPTED
 
   MAJORITY NOMINAL     a detector needs negatives -> 60% of episodes clean
 
-  ONSET IN THE MIDDLE  every onset lands in the 40-60% window, never t=0, so
-                       each faulted episode holds THREE PHASES:
+  ONSET AFTER 10 s     every onset is uniform between 10 s and 90% of the
+                       episode, never t=0, so each faulted episode holds
+                       THREE PHASES:
                        clean baseline -> transition -> settled faulted regime.
                        A fault at t=0 teaches regime recognition, not detection.
 
-  SEVERITY >= 0.30     a fault too weak to have an effect is a MISLABELLED
+  SEVERITY >= 0.50     a fault too weak to have an effect is a MISLABELLED
                        nominal episode - worse than no episode at all.
 
   Consequence worth stating: episode-level 40% faulted, but SAMPLE-level only
@@ -162,7 +165,8 @@ IDEA 5 - UNATTENDED MEANS HANDLING THE BAD CASES
   persist for the life of the process. An episode inheriting the previous one's
   flat battery would be LABELLED NOMINAL and look nothing like one.
 
-  FALLING OFF THE TERRAIN (seen for real: 13 of 20 episodes in run01). A
+  FALLING OFF THE TERRAIN (seen for real: 13 of 20 episodes in an early,
+  since deleted run). A
   drive_straight goes wherever the rover faces, and waypoint clamping never
   limited it, so the rover drove over the edge and free-fell ~25 s until the
   500 m sanity check fired - labelled "physics diverged", with the fall still
@@ -184,6 +188,42 @@ IDEA 5 - UNATTENDED MEANS HANDLING THE BAD CASES
 
   DISK GUARD. Refuses to start an episode below --min-free-gb, stops cleanly at
   --max-disk-gb. ~20 MB/episode with frames, ~2 GB per 100 episodes.
+
+--------------------------------------------------------------------------------
+IDEA 6 - NO CHANNEL IS A CLOCK
+--------------------------------------------------------------------------------
+
+  A reset is not a power-on. Started from one fixed state, every slow channel
+  counts episode time from it, and a model reads the time off the channel
+  instead of the rover's state. In an earlier fixed-start run (since
+  deleted), from the value alone:
+
+      channel              share of time_s variance explained (R^2)
+      temperature_bottom   0.996      (all faces start at 20 C, tau = 600 s)
+      battery_charge       0.985      (always starts at 100%)
+      obc_uptime           0.887      (restarts at 0, on WALL time)
+      reacquisitions       0.384      (counter restarts at 0)
+
+  So each episode starts as a mission in progress would have left it:
+
+      battery charge       uniform 50-100%  (a drive is started above half)
+      face temperatures    1800 s (3 tau) of driving at random headings held
+                           10-60 s each, ending at the current heading. NOT
+                           "parked, then turned": that start leaves faces at
+                           -47 / +90 C, and they visibly relax over the run
+      OBC uptime           30 min - 3 days since boot, counted in SIM time
+      filter position      random point within 50 m of its frame origin
+      reacquisitions       since boot: Poisson(0.0067/s x uptime)
+      pre-roll             0-60 s driven before t=0, not recorded, so row 0
+                           can fall mid-leg instead of on a rover at rest
+                           with a freshly reset filter
+
+  Fault onsets and housekeeping stay measured from t=0. The draws use their
+  own seed stream, so spawn and scene are unchanged, and meta.json records
+  them under initial_state. Measured on all10_randstart (100 episodes): R^2
+  is below 0.05 for every face temperature and for obc_uptime, except
+  battery at 0.18 - a pack only drains while driving, so a charge below 50%
+  still says "late".
 
 --------------------------------------------------------------------------------
 NUMBERS FOR THE SLIDE

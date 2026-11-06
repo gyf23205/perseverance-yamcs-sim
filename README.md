@@ -45,6 +45,7 @@ that split.
 - [Dataset generation](#dataset-generation)
   - [What an episode is](#what-an-episode-is)
   - [The fault schedule](#the-fault-schedule)
+  - [Choosing a seed for a per-kind minimum](#choosing-a-seed-for-a-per-kind-minimum)
   - [The crater scenario (`--crater`)](#the-crater-scenario---crater)
   - [Observable vs oracle](#observable-vs-oracle)
   - [How each fault appears in the data](#how-each-fault-appears-in-the-data)
@@ -205,7 +206,7 @@ image metadata parameters updated with each frame.
 | Group | Parameters |
 |---|---|
 | Pose | `pose_ground_truth`, `imu_accelerometer`, `imu_gyroscope`, `imu_orientation` |
-| Mobility | `motor_encoder` (6 drive joints), `motor_effort` (6 drive joints, N·m, the solver's measured joint force — see [Motor effort](#motor-effort-what-it-measures)), `steer_encoder` (4 corners, deg), `contact_force_*` (6 wheels) |
+| Mobility | `motor_encoder` (6 drive joints, rad/s: measured wheel speed averaged over the downlink interval, front, mid, rear, left then right), `motor_effort` (6 drive joints, N·m, the solver's measured joint force — see [Motor effort](#motor-effort-what-it-measures)), `steer_encoder` (4 corners, deg), `contact_force_*` (6 wheels) |
 | **Estimator** | `estimator/*` (15): the onboard navigation filter's estimated pose, motion and IMU biases, its per-sensor residuals, and its fault alarms — see [Navigation filter and fault residuals](#navigation-filter-and-fault-residuals) |
 | Power | `battery_charge`, `battery_voltage`, `net_power`, `total_current_in/out`, `current_draw_*` |
 | Thermal / comms | `temperature_*` (6 faces), `radio_rssi` |
@@ -376,7 +377,7 @@ Below 0.05 m/s the drag fades to zero, so it doesn't flip direction every step. 
 above the 0.5 friction: with `ALL` at 1.0 the soil drags harder than the wheels can grip, so they spin
 and the rover stalls.
 
-**Telling slip from sink.** In both, `motor_encoder` runs ahead of `pose_ground_truth`. The
+**Telling slip from sink.** In both, the wheel speed on `motor_encoder` stays up while `pose_ground_truth` barely moves. The
 difference is `/Rover/motor_effort`: close to zero when a wheel spins on ice, high when it grinds
 through soil. A slipping rover also coasts and slides downhill; a sunk one stops quickly and holds on
 slopes.
@@ -411,8 +412,8 @@ the other five. The rover still reaches 3.0 m — that is the closed loop doing 
 it stalls instead: `command_distance_remaining` flattens out and stops falling.
 
 The other wheel faults read differently on the same drive. `inject_wheel_stuck_fault(MID_LEFT, 0.9)`
-pulls the rover toward that side, with that wheel's `motor_encoder` barely advancing.
-`inject_wheel_slip_fault(ALL, 1.0)` leaves every encoder turning while the pose barely changes.
+pulls the rover toward that side, with that wheel's speed on `motor_encoder` near zero.
+`inject_wheel_slip_fault(ALL, 1.0)` leaves every wheel turning while the pose barely changes.
 `inject_wheel_sink_fault(ALL, 1.0)` does the same, but with `motor_effort` high instead of low.
 
 For the steer faults, watch `/Rover/steer_encoder`. A *stuck* corner holds one constant angle while
@@ -592,20 +593,30 @@ commands and nav-cam frames — with the injected faults as ground-truth labels.
 ```bash
 /isaac-sim/python.sh /workspace/omnilrs/my_files/src/run_perseverance.py \
     --headless \
-    --dataset-out my_files/datasets/run01 \
+    --dataset-out my_files/datasets/my_run \
     --episodes 100
 ```
 
 No ground station is needed and none is used. Put the output under `my_files/` — it is the only
-bind-mounted path, so anything written elsewhere dies with the `--rm` container.
+bind-mounted path, so anything written elsewhere dies with the `--rm` container. The recorded
+datasets, and the command for each, are listed in [`my_files/datasets/README.md`](../datasets/README.md).
 
 ### What an episode is
 
 One episode is a self-contained run: a fresh spawn pose, a fresh fault schedule, a fresh randomized
-mission, and a full reset of everything stateful in between — battery back to 100 %, face
-temperatures back to their initial value, OBC uptime restarted, every injected fault cleared. Without
-that reset an episode would inherit the previous one's flat battery and be labelled nominal while
-looking nothing like one.
+mission, and a full reset of everything stateful in between — every injected fault cleared, every
+device on, GO set. Without that reset an episode would inherit the previous one's flat battery and be
+labelled nominal while looking nothing like one.
+
+The reset is not a power-on, though. Started from one fixed state, the slow channels count episode
+time (in an earlier fixed-start run, since deleted, `battery_charge` alone explained 98.5 % of the
+variance of `time_s`), so each episode
+starts as a mission in progress would have left it: battery charge uniform in 50–100 %, face
+temperatures from a random heading history, OBC uptime 30 min to 3 days (counted in simulation time),
+the filter's position at a random point of its frame and its reacquisition counter since boot. The
+rover then drives for a random 0–60 s pre-roll that is not recorded, so the first row can fall in the
+middle of a leg. The ranges are under `dataset.episode` in the robot config, and each episode's draws
+are in its `meta.json` under `initial_state`.
 
 The rover is driven by a seeded random operator that chains `goto` / `drive_straight` / `drive_turn`,
 one at a time, issuing the next when the last completes. Completion is decided on measured pose, so a
@@ -625,7 +636,8 @@ Two rules matter more than the mix:
 **Most of the dataset is clean.** A detector needs negatives, so the majority of episodes carry no
 fault at all.
 
-**Onsets sit in the middle of the episode**, never at the start. Every faulted episode therefore has
+**Onsets are uniform between 10 s and 90 % of the episode** (`onset_min_s`, `onset_max`), never at
+the start. Every faulted episode therefore has
 three phases — a clean baseline, the transition, and the settled faulted regime. A fault that started
 at `t=0` would teach a classifier to recognise a regime rather than to detect anything.
 
@@ -636,6 +648,31 @@ manifest reports both.
 All of it is tunable under `dataset.faults` in `cfg/robot/perseverance.yaml`. Note that
 `kind_weights` merges into the defaults, so excluding a fault kind means setting it to `0`, not
 omitting it.
+
+### Choosing a seed for a per-kind minimum
+
+Each episode draws its class and fault kinds independently, so the default mix does not guarantee a
+count per kind. At 300 episodes it expects ~16 episodes per kind, and ~11 for `steer_stuck` (weight
+0.7). The schedule depends only on the episode seed (`dataset_seed * 100003 + index`) and the
+episode length, so the counts can be checked on the host before a run, without Isaac Sim:
+
+```python
+import sys, collections, yaml
+sys.path.insert(0, "/home/yifan/git/OmniLRS")
+from src.mission_specific.perseverance.dataset import fault_scheduler as fs
+cfg = yaml.safe_load(open("/home/yifan/git/OmniLRS/cfg/robot/perseverance.yaml"))
+cfg = cfg["robots_settings"]["parameters"]["dataset"]["faults"]
+for seed in range(200):
+    count = collections.Counter(k for i in range(300)
+        for k in {f.kind for f in fs.generate(seed * 100003 + i, 18000 * 0.0333, cfg).faults})
+    if min(count[k] for k in fs.KIND_SHAPES) >= 12:
+        print(seed, dict(count))
+```
+
+An episode counts once per kind it carries, whether single, concurrent or sequential. With the
+default config, 19 of seeds 0–199 reach 12 per kind; seed 62 gives 15–24 (see
+[`my_files/datasets/README.md`](../datasets/README.md)). Selecting a seed this way biases only the
+class and kind counts: onset times, initial states and waypoints come from the same distributions.
 
 ### The crater scenario (`--crater`)
 
@@ -678,7 +715,7 @@ Every episode is split in two. This is the point of the whole exercise: a detect
 what a real mission could see.
 
 ```
-my_files/datasets/run01/
+my_files/datasets/all10_randstart/
   manifest.json              schema, column tags, class balance, seeds
   episodes/ep_0000/
     meta.json                seed, spawn, outcome, per-episode drop counts
@@ -725,11 +762,11 @@ from the schedule — so a fault set some other way is still labelled correctly.
 | Fault | Observable signature |
 |---|---|
 | wheel / steer torque | the trajectory degrades; `oracle.wheel_torque_limit.*` drops |
-| wheel stuck | one `motor_encoder` wheel barely advances while the rover pulls toward it, with that wheel's `motor_effort` high; `oracle.wheel_damping_factor.*` rises |
-| wheel slip | `motor_encoder` keeps advancing while `pose_ground_truth` barely moves, with **low** `motor_effort`; `oracle.wheel_friction.*` drops |
+| wheel stuck | one wheel's speed on `motor_encoder` drops toward zero while the rover pulls toward it, with that wheel's `motor_effort` high; `oracle.wheel_damping_factor.*` rises |
+| wheel slip | the wheel speeds on `motor_encoder` stay up while `pose_ground_truth` barely moves, with **low** `motor_effort`; `oracle.wheel_friction.*` drops |
 | wheel sink | the rover slows and stops quickly, with **high** `motor_effort`; body sits lower and tilts toward the sunk wheel; `oracle.wheel_sinkage.*` rises |
 | steer stuck | one corner of `steer_encoder` holds a constant angle |
-| crater (trapped) | `motor_encoder` and `motor_effort` keep working while `pose_ground_truth` stops changing, with a strong pitch or roll on `imu_orientation`; `command_distance_remaining` flattens and commands end in `stop` |
+| crater (trapped) | the wheel speeds on `motor_encoder` and `motor_effort` keep working while `pose_ground_truth` stops changing, with a strong pitch or roll on `imu_orientation`; `command_distance_remaining` flattens and commands end in `stop` |
 | IMU | `imu_*` shifts or roughens; `oracle.imu_error.*` gives the exact residual |
 | camera | frames missing from `images_index.csv`, or visibly grainy |
 | battery | `battery_charge` bends down, `net_power` drops by `severity × 40 W` |
@@ -811,7 +848,7 @@ differ by 0.02 of 255, and two runs of the skipped-rendering path by 0.01.
 
 Two things that will happen over a long unattended run, both handled rather than left to chance:
 
-**The rover drives off the terrain.** Seen for real: 13 of the 20 episodes in `run01` ended with the
+**The rover drives off the terrain.** Seen for real: 13 of the 20 episodes in an early run (since deleted) ended with the
 rover going over the edge during a `drive_straight` (waypoints were clamped to the terrain, straights
 were not) and free-falling for ~25 s until the old 500 m check fired. Two fixes: every straight is now
 cut short where the rover's heading leaves the mission bounds, or replaced by a goto when there is no
@@ -846,7 +883,7 @@ docker run --rm --entrypoint bash -v ~/docker/isaac-sim/my_files:/mf \
 ### Checking a dataset
 
 ```bash
-/isaac-sim/python.sh scripts/verify_dataset.py my_files/datasets/run01
+/isaac-sim/python.sh scripts/verify_dataset.py my_files/datasets/all10_randstart
 ```
 
 Reads the files with pandas and no knowledge of the writing code: per-episode shape, distance
@@ -859,7 +896,7 @@ may not have a working pandas.
 
 ```bash
 cd ~/docker/isaac-sim/my_files/src
-python3 visualize_dataset.py ../datasets/run01
+python3 visualize_dataset.py ../datasets/all10_randstart
 ```
 
 Writes PNGs into `DATASET/plots`:
@@ -924,7 +961,7 @@ axis, as computed by the physics solver. It comes from Isaac Sim's articulation 
 (`isaacsim.core.prims.SingleArticulation.get_measured_joint_efforts`). The old reading does not follow slope or
 acceleration at all, so it is not a torque. The new one is about the size the fault-injection
 sizing predicts (~6.6 N·m to hold a 15° slope). This changes the downlinked `/Rover/motor_effort`
-too: **the `motor_effort` column of every dataset recorded before this change, including `run01`, is
+too: **the `motor_effort` column of any dataset recorded before this change is
 noise.** It falls back to `STATE_EFFORT`, with a warning, only if the articulation view cannot be
 built.
 

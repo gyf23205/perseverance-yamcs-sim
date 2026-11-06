@@ -376,7 +376,7 @@ DATASET GENERATION  (--dataset-out)
     The same injector, driven by a scheduler instead of an operator, to build a
     labelled dataset for training fault detection.
 
-        run_perseverance.py --headless --dataset-out my_files/datasets/run01 \
+        run_perseverance.py --headless --dataset-out my_files/datasets/my_run \
                             --episodes 100
 
     ONE INJECTION PATH.  The scheduler calls the same public inject_* methods the
@@ -411,7 +411,7 @@ DATASET GENERATION  (--dataset-out)
         Label from the TRUE POSE (oracle.crater.in_crater), not the plan.
         30% of crater episodes also carry one injected fault.
 
-        Onsets sit in the MIDDLE of the episode, never at t=0, so every faulted
+        Onsets are uniform between 10 s and 90% of the episode, never t=0, so every faulted
         episode holds three phases: clean baseline, transition, settled regime.
         Sample-level faulted fraction is therefore ~15-20%, far below the 40%
         episode-level rate.  The manifest reports both.
@@ -462,7 +462,7 @@ DATASET GENERATION  (--dataset-out)
                             before the blow-up, and recovers on the next reset --
                             or stops the run if the rover does not come back.
                             Waypoints are clamped to the terrain.
-        falling off terrain 13 of 20 episodes in run01 drove over the edge on a
+        falling off terrain 13 of 20 episodes in an early run drove over the edge on a
                             drive_straight. Straights are now cut short at the
                             mission bounds, and a rover outside the DEM or 0.5 m
                             below the ground ends the episode as "aborted: fell

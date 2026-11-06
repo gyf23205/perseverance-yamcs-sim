@@ -17,8 +17,8 @@ injection and dataset generation, see [README.md](README.md).
 - [Validation in Isaac Sim](#validation-in-isaac-sim)
 
 The rover runs an onboard **extended Kalman filter (EKF)** at the physics rate (30 Hz). It estimates
-the rover's motion from its own sensors and compares every sensor with what the estimate predicts
-that sensor should read. Those disagreements, the **residuals**, are what a fault detector
+the rover's motion from its own sensors and compares every sensor reading with its expected reading:
+the value the sensor should read if the estimate were exact. Those disagreements, the **residuals**, are what a fault detector
 consumes. They are downlinked under `/Rover/estimator` and recorded as **observable** columns.
 
 - **Inputs:** IMU, drive-joint rates, drive-joint torques, steer angles, and the wheel rates the
@@ -36,9 +36,10 @@ consumes. They are downlinked under `/Rover/estimator` and recorded as **observa
 | Process noise $Q$ | how much the motion model is allowed to be wrong per step |
 | Measurement noise $R$ | the variance of a sensor's noise |
 | Gain $K$ | how strongly one measurement corrects each state |
-| Innovation $\tilde y$ | a sensor reading minus the reading the filter predicted, before the correction |
+| Expected reading $h(\hat{\mathbf x}^-)$ | the value a sensor should read if the state estimate were exact, computed with the measurement model $h$. Not a prediction in time |
+| Innovation $\tilde y$ | a sensor reading minus its expected reading, before the correction |
 | Residual | here: an innovation, or one of the monitor-only residuals defined below |
-| Normalized innovation | $\tilde y/\sqrt S$, where $S$ is the predicted variance of $\tilde y$; about standard normal on a healthy rover |
+| Normalized innovation | $\tilde y/\sqrt S$, where $S$ is the expected variance of $\tilde y$; about standard normal on a healthy rover |
 | NIS | normalized innovation squared, $\tilde y^2/S$; its average is about 1 when $Q$ and $R$ are right |
 | χ² gate | do not use a reading to update the state when its NIS exceeds 10.828, which a healthy sensor does with probability 0.1% (chi-squared distribution, 1 degree of freedom) |
 | Random walk | the model for a quantity with no known dynamics: "no change expected, but it may drift", at a rate set by $q$ |
@@ -69,18 +70,21 @@ Tests (plain `python3`, no Isaac Sim): `test/test_nav_models.py`, `test_nav_ekf.
 
 ## Why online, at 30 Hz
 
-The downlink cannot support an offline filter. `motor_encoder` is a joint angle wrapped to one
-revolution (1024 counts) and sampled at 1 Hz. At scale 0.35 the wheel radius is
-$r = 0.2625 \cdot 0.35 = 0.0919$ m. The wrapped angle only unambiguously resolves a wheel turn of
-less than half a revolution per sample:
+The filter needs every sensor at the physics rate (30 Hz); the downlink carries one value per second.
+Until 2026-10-11 the wheel channel could not even give the wheel rate: `motor_encoder` was a joint angle
+wrapped to one revolution (1024 counts) and sampled at 1 Hz. At scale 0.35 the wheel radius is
+$r = 0.2625 \cdot 0.35 = 0.0919$ m, and a wrapped angle only resolves a turn of less than half a
+revolution per sample:
 
 ```math
 |\dot\theta| < \frac{\pi}{1\,\text{s}} \quad\Longleftrightarrow\quad |v| < \pi r \approx 0.29\ \text{m/s}
 ```
 
-The mission scripter drives at 0.15–0.35 m/s, and `goto` at 0.3 m/s, so the downlinked encoder
-aliases at normal speeds. The filter therefore runs inside the simulation loop, directly after
-`fault_injector.update()`, on the unwrapped joint rates (`Robot.get_wheel_joint_velocities`).
+The mission scripter drives at 0.15–0.35 m/s, and `goto` at 0.3 m/s, so that encoder aliased at normal
+speeds. `motor_encoder` now carries each wheel's rate averaged over the downlink interval, which no
+longer aliases, but a 1 s mean still hides everything faster than a second. The filter therefore runs
+inside the simulation loop, directly after `fault_injector.update()`, on the joint rates at physics
+rate (`Robot.get_wheel_joint_velocities`).
 
 ## Frames and conventions
 
@@ -228,7 +232,7 @@ sections below give this filter's specific $f$, $h$, $F$, $H$, $Q$ and $R$.
 | $\mathbf u$ | — | inputs that drive the prediction but are not estimated: accelerometer $a_f, a_l$, pitch rate $\omega_{\text{left}}$, roll $\phi$, pitch $\theta$ |
 | $f$ | — | process model: predicts the next state from the current one and the inputs |
 | $\mathbf w$, $Q$ | 8×1, 8×8 | process noise and its covariance: how wrong $f$ may be per step |
-| $\mathbf z$, $h$ | 1×1 per channel | a sensor reading, and the measurement model that predicts it from the state |
+| $\mathbf z$, $h$ | 1×1 per channel | a sensor reading, and the measurement model that gives its expected reading from the state |
 | $\mathbf n$, $R$ | 1×1 per channel | measurement noise and its variance |
 | $F = \partial f/\partial\mathbf x$ | 8×8 | process Jacobian, evaluated at the current estimate |
 | $H = \partial h/\partial\mathbf x$ | 1×8 per channel | measurement Jacobian, evaluated at the predicted estimate |
@@ -244,7 +248,7 @@ sections below give this filter's specific $f$, $h$, $F$, $H$, $Q$ and $R$.
   heading becomes an uncertain position after driving.
 - $+\,Q$ adds the uncertainty the model itself introduces. So $P$ always grows in this step.
 
-**Update.** Compare a reading with its prediction, and correct the estimate:
+**Update.** Compare a reading with its expected reading $h(\hat{\mathbf x}^-)$, and correct the estimate:
 
 ```math
 \tilde{\mathbf y} = \mathbf z - h(\hat{\mathbf x}^-), \qquad S = H P^- H^\top + R, \qquad K = P^- H^\top S^{-1}
@@ -254,7 +258,7 @@ sections below give this filter's specific $f$, $h$, $F$, $H$, $Q$ and $R$.
 \hat{\mathbf x} = \hat{\mathbf x}^- + K\tilde{\mathbf y}, \qquad P = (I - KH)\,P^-
 ```
 
-- $\tilde{\mathbf y}$ is the innovation, and $S$ its predicted covariance: the state uncertainty seen through $H$,
+- $\tilde{\mathbf y}$ is the innovation, and $S$ its expected covariance: the state uncertainty seen through $H$,
   plus the sensor noise.
 - The gain $K$ weighs the two. If the state is uncertain compared with the sensor ($HP^-H^\top \gg R$),
   $K$ is large and the reading moves the estimate a lot; if the sensor is noisy, $K$ is small.
@@ -281,7 +285,7 @@ These are described in [Measurement models (update)](#measurement-models-update)
 
 | State | Meaning |
 |---|---|
-| $p_x, p_y$ | position in an **episode-local** frame, with the origin where the episode started (no truth needed to initialize) |
+| $p_x, p_y$ | position in a **local** frame, set where the filter was reset (no truth needed to initialize). The dataset runner starts it at a random point within 50 m of the origin, as after driving since the frame was set |
 | $\psi$ | heading of the forward axis, the same definition as `drive_controller._pose()` |
 | $v$ | forward speed along the ground |
 | $v_{\text{lat}}$ | sideways sliding speed, positive left; zero on a rover with grip |
@@ -296,7 +300,7 @@ true bias, or whether a fault was injected. It appends the biases to the state a
 with the motion, which is standard practice in inertial navigation (bias augmentation):
 - **Assumed form:** each bias is roughly constant and may drift slowly (a random walk). It enters
   the dynamics in a known way: $b_a$ is subtracted from $a_f$ in the prediction, and the gyro-$z$
-  measurement model predicts the reading as $\omega + b_g$.
+  measurement model gives the expected reading as $\omega + b_g$.
 - **Initial value:** $0$, with the prior uncertainty in $P_0$.
 - **How it is learned:** neither bias is measured directly. Wheel odometry also constrains $v$ and
   $\omega$. When the integrated IMU keeps disagreeing with the wheels, the Kalman gain assigns part of
@@ -349,7 +353,7 @@ speed, roll, pitch, 3-axis biases) would add nothing here:
 
 What it misses: all six wheels are assumed to move with one rigid-body motion on one contact plane.
 On rough ground the rocker-bogie lets each wheel climb or drop on its own local slope, so its rolling
-speed differs from the prediction. That error is absorbed into the fitted $\sigma_{\text{wheel}}$,
+speed differs from its expected reading. That error is absorbed into the fitted $\sigma_{\text{wheel}}$,
 which makes the wheel residuals less sensitive to faults on very rough terrain. Position is
 horizontal only (no altitude).
 
@@ -397,8 +401,11 @@ F =
 $Q$ is diagonal:
 
 ```math
-Q = \operatorname{diag}\!\big(q_p\Delta t,\ q_p\Delta t,\ q_\psi\Delta t,\ (\sigma_a\Delta t)^2,\ (\sigma_a\Delta t)^2,\ q_\omega\Delta t,\ q_{b_g}\Delta t,\ q_{b_a}\Delta t\big)
+Q = \operatorname{diag}\!\big(q_p\Delta t + q_d\Delta s,\ q_p\Delta t + q_d\Delta s,\ q_\psi\Delta t,\ (\sigma_a\Delta t)^2,\ (\sigma_a\Delta t)^2,\ q_\omega\Delta t,\ q_{b_g}\Delta t,\ q_{b_a}\Delta t\big)
 ```
+
+where $\Delta s = \sqrt{v^2 + v_{\text{lat}}^2}\,\Delta t$ is the distance driven over the step, from the
+speeds the step starts with.
 
 - **Speeds, $(\sigma_a\Delta t)^2$: accelerometer noise.** $\sigma_a$ is the standard deviation of one
   accelerometer sample. A reading $a_f = a_{\text{true}} + \epsilon$, $\epsilon \sim \mathcal N(0, \sigma_a^2)$,
@@ -437,6 +444,7 @@ Q = \operatorname{diag}\!\big(q_p\Delta t,\ q_p\Delta t,\ q_\psi\Delta t,\ (\sig
     kinematics missed on rough terrain), $q_{b_g}$ and $q_{b_a}$ (slow bias drift). $q_\omega$ and
     $q_\psi$ are fitted so the gyro and heading NIS average 1; $q_{b_g}$ and $q_{b_a}$ are set by hand.
   - **Numerical:** $q_p$ models no physical drift; it only keeps $P$ well conditioned (next bullet).
+  - **Odometry:** $q_d$ is a random walk in distance rather than in time (bullet after next).
 - **Position, $q_p = 10^{-6}$ m²/s, is for numerical conditioning only.** Position follows exactly
   from $v$, $v_{\text{lat}}$ and $\psi$, whose uncertainty $FPF^\top$ already carries into it; in this
   Euler step no noise enters $p$ directly, so its analytic $Q$ entry is 0. But position is never
@@ -448,6 +456,31 @@ Q = \operatorname{diag}\!\big(q_p\Delta t,\ q_p\Delta t,\ q_\psi\Delta t,\ (\sig
   $q_p\Delta t \approx 3\times10^{-8}$ m² under every eigenvalue of $P^-$. The added drift is
   negligible (7.7 mm std over 60 s). $q_p$ is set by hand: no channel measures position, so the
   NIS-based fit cannot tune it. The Joseph form protects $P$ the same way in the update step.
+- **Position, $q_d$ = `q_odometry` = 0.00329 m² per metre driven per axis: odometry drift.** Without
+  it the filter is badly overconfident in position: on 14 nominal episodes of
+  `ekf_run01` (since deleted), the true $x$ and $y$ lay inside their $\pm2\sigma$ bounds only 1% of
+  the time, with errors 3–36σ. The cause is the white-noise model of the wheels. $R_{\text{wheel}}$ assumes
+  an independent error every 33 ms, so six wheels at 30 Hz average to a very precise $v$, and
+  $FPF^\top$ lets the position variance grow only slowly. Real odometry errors are slow (the terrain
+  under each wheel, scrub, sinkage) and do not average out. On those episodes the squared position
+  error grows linearly with distance, at 0.005–0.008 m² per metre for both axes together: a random
+  walk in distance, which is what $q_d\Delta s$ models.
+  - **It changes nothing but the position variance.** No measurement model contains $p_x$ or $p_y$,
+    so their columns of $H$ are zero. An extra $\Delta P$ on the position block then enters neither
+    $S = HPH^\top + R$ nor $K = PH^\top/S$, and passes unchanged through the Joseph update, because
+    the position columns of $I - KH$ are identity columns. The state, every residual, every NIS and
+    every alarm are bit-identical with or without it (checked in `test/test_nav_ekf.py`), and the
+    position variance becomes exactly $P_{xx}(t) + q_d\,d(t)$, with $d(t)$ the distance driven.
+  - **Fitted** so that both position errors lie inside their 2σ bounds $0.954^2 = 91\%$ of the
+    time, as independent Gaussian errors would (step 8 of the fit below). Result: 91% on the
+    14 nominal episodes; 84% and 95% when fitted on 7 episodes and tested on the other 7; 91.1% on the
+    fault-free first part of the 36 faulted episodes of the same dataset, none used in the fit. The
+    textbook criterion, mean NEES (normalized estimation error squared) = 2, would give about
+    0.005 m²/m and 97% coverage; it was not used because the short heading spikes give the error
+    heavy tails that inflate the mean.
+  - A wheel-odometry scale-factor state would model the slow error more faithfully, but it enters
+    the wheel measurement models, so it would change the residuals and need refitting and
+    revalidating the whole detector.
 
 **Initialization.** On the first step of an episode (after the landing hold or the episode settle),
 $\mathbf x = [0, 0, \psi_{\text{imu}}, 0, 0, 0, 0, 0]$ and
@@ -478,8 +511,8 @@ K = P H^\top / S, \qquad \hat{\mathbf x} \leftarrow \hat{\mathbf x} + K\tilde y,
 P \leftarrow (I - K H)\,P\,(I - K H)^\top + R\,K K^\top
 ```
 
-- $\tilde y$ is the innovation: the reading minus the reading predicted from the current estimate.
-- $S$ is the predicted variance of $\tilde y$. It is the sum of two parts: $HPH^\top$, the state
+- $\tilde y$ is the innovation: the reading minus its expected reading, computed from the current estimate.
+- $S$ is the expected variance of $\tilde y$. It is the sum of two parts: $HPH^\top$, the state
   uncertainty seen through the sensor, and $R$, the sensor noise. Here it is a number, so $S^{-1} = 1/S$.
 - NIS is $\tilde y^2/S$. On a healthy rover it averages about 1, and a reading with NIS above the
   gate does not update the state.
@@ -495,7 +528,7 @@ moving with $(v, v_{\text{lat}}, \omega)$ gives the wheel at $(x_i, y_i)$ the gr
 (forward, left) $= (v - \omega x_i,\ v_{\text{lat}} + \omega y_i)$. A wheel steered by $\delta_i$
 rolls along $(\cos\delta_i, \sin\delta_i)$. Its spin rate sensor measures the spin rate $\dot\theta_i$.
 If the wheel does not slip, $r\dot\theta_i$ equals the wheel's ground speed along its rolling
-direction. The model predicts this speed by projecting the wheel's ground velocity onto that
+direction. The model gives the expected value of this speed by projecting the wheel's ground velocity onto that
 direction:
 
 ```math
@@ -593,7 +626,7 @@ Wheel residuals are still judged against the gyro's $\omega$.
 they were. Its innovation is still computed and published. Each channel type handles such readings
 differently.
 
-**Rolling speeds: one common prediction, at most 2 wheels left out of the update.** `_update_group()` processes the
+**Rolling speeds: one common state estimate, at most 2 wheels left out of the update.** `_update_group()` processes the
 6 wheels in two passes:
 1. **Report and gate.** All 6 innovations $\tilde y_i = z_{\text{wheel},i} - h_{\text{wheel},i}(\hat{\mathbf x}^-)$
    and their NIS are computed against the same state $\hat{\mathbf x}^-$, before any wheel updates the state.
@@ -605,7 +638,7 @@ Without the first pass, the processing order would distort the residuals. Each u
 toward that wheel's reading, so later wheels are compared with a state that earlier wheels have
 already moved. If wheel 1 were stuck and processed first, it would pull $v$ toward 0; the healthy
 wheels 2–6 would then all show innovations, and the fault would be spread over all six. With one
-common prediction, the stuck wheel shows a large residual and the healthy ones show small residuals,
+common state estimate, the stuck wheel shows a large residual and the healthy ones show small residuals,
 whatever the order.
 
 Of the wheels that fail the gate, only the worst `max_gated_wheels` = 2 (by NIS) are left out of the
@@ -634,8 +667,8 @@ is still published. The rolling-speed limit is not needed here, for two reasons:
 **Gyro and heading: reacquisition.** These channels use the gate plus a recovery rule, in
 `_update_channel()`.
 
-*The problem: gate lockout.* The gate works for a single outlier, but fails when the offset between
-reading and prediction persists. Take a gyro whose bias suddenly steps up (an injected fault):
+*The problem: gate lockout.* The gate works for a single outlier, but fails when the offset between the
+reading and its expected reading persists. Take a gyro whose bias suddenly steps up (an injected fault):
 1. The reading is now offset from $h_{\text{gyro}} = \omega + b_g$, so its NIS exceeds the gate and it
    does not update the state.
 2. Since the state is not updated, $\hat b_g$ never moves toward the new bias.
@@ -689,21 +722,59 @@ a turn, and the shortfall persists while it slides. Steady sliding on flat groun
 it is invisible here; physically it does not happen.
 
 **Drive torque (per wheel).** `motor_effort` is now the solver's measured joint force
-(`Articulation.get_measured_joint_efforts`); see [Motor effort](README.md#motor-effort-what-it-measures). The
-wheel must push its share of the rover through the forward specific force (acceleration plus the
-slope's pull, which is exactly what $a_f$ measures), plus resistances. The model is linear in its
-coefficients:
+(`Articulation.get_measured_joint_efforts`); see [Motor effort](README.md#motor-effort-what-it-measures).
+Wheel $i$'s measured torque is $\tau_i$. The model gives its expected value $\hat\tau_i$ as a load term plus
+resistance terms.
+
+*Load term.* Rearranging the $v$ equation of the prediction step gives what the forward
+accelerometer measures, once its bias is removed:
+
+```math
+a_f - b_a = \underbrace{\dot v - \omega\,v_{\text{lat}}}_{\text{forward acceleration}} + \underbrace{g\sin\theta}_{\text{slope pull}}
+```
+
+Along the forward axis, Newton's law with rover mass $m$, total drive force $F_{\text{drive}}$ and total
+resistance $F_{\text{resist}}$ is
+
+```math
+m\,(\dot v - \omega\,v_{\text{lat}}) = F_{\text{drive}} - F_{\text{resist}} - m\,g\sin\theta
+\quad\Rightarrow\quad
+F_{\text{drive}} - F_{\text{resist}} = m\,(a_f - b_a)
+```
+
+So the drive force that accelerates the rover and holds it against the slope is the mass times the
+bias-corrected $a_f$; no separate slope or acceleration estimate is needed. Wheel $i$ carries a share
+$m_i$ of the mass. With wheel radius $r$, its load torque is
+
+```math
+\tau_{\text{load},i} = r\,m_i\,(a_f - b_a) = c_{1,i}\,(a_f - b_a), \qquad c_{1,i} \approx r\,m_i
+```
+
+*Full model.* The resistance terms are added to the load term. The model is linear in its
+coefficients $c_{1,i}, \dots, c_{5,i}$:
 
 ```math
 \hat\tau_i = c_{1,i}\,(a_f - \hat b_a) + c_{2,i}\tanh\!\Big(\frac{\dot\theta_i}{0.05}\Big) + c_{3,i}\,\dot\theta_i + c_{4,i}\,\ddot\theta_i + c_{5,i}\,|\hat\omega|
 ```
 
-The terms are, in order: load ($c_1 \approx r\,m_i$), rolling resistance, viscous loss, wheel
-inertia, and steering scrub.
+$c_{k,i}$ is the coefficient of term $k$ for wheel $i$: 5 per wheel, 30 in total. Each multiplies one
+regressor, a quantity computed from measurements and the estimate (`torque_features()` in
+`monitor.py`):
+
+| Coefficient | Regressor | Physical meaning | Unit of $c$ |
+|---|---|---|---|
+| $c_{1,i}$ | $a_f - \hat b_a$ | load: the wheel's share of accelerating the rover and holding it on the slope ($c_{1,i} \approx r\,m_i$) | kg·m |
+| $c_{2,i}$ | $\tanh(\dot\theta_i/0.05)$ | rolling resistance: constant size, opposes the direction of rotation; tanh fades it to 0 near standstill instead of flipping sign | N·m |
+| $c_{3,i}$ | $\dot\theta_i$ | viscous loss: joint and soil damping, grows with spin rate | N·m·s/rad |
+| $c_{4,i}$ | $\ddot\theta_i$ | wheel inertia: torque to spin the wheel itself up | kg·m² |
+| $c_{5,i}$ | $\lvert\hat\omega\rvert$ | steering scrub: wheels dragged sideways in a turn | N·m·s/rad |
+
+The values are not set by hand. Step 5 of [Fitting the parameters](#fitting-the-parameters) fits them
+per wheel by least squares on nominal episodes, and they are stored in `cfg/robot/perseverance.yaml`
+under `torque_model.coefficients`, one list $[c_1, \dots, c_5]$ per wheel.
 - $\ddot\theta_i$ is an exponential moving average (weight 0.2) of the finite-difference joint
   acceleration.
-- The coefficients are fitted by least squares on nominal data. The fitted $c_1$ values sum to a
-  plausible ~560 kg, with the rear wheels carrying the most.
+- The fitted $c_{1,i}$ give a plausible total mass, $\sum_i c_{1,i}/r \approx 51.5 / 0.0919 \approx 560$ kg, with the rear wheels carrying the most.
 
 The residual is the **excess torque in the direction of motion**:
 
@@ -728,22 +799,55 @@ stuck or torque-limited cannot ($> 0$). The command is stored by `drive_controll
 
 ### Why the torque does not update the state
 
-Suppose wheel $i$'s torque $\tau_i$ were used as a scalar measurement. Its model is $\hat\tau_i$, and
-$b_a$ is the state in it that can absorb an error. Write the other terms as $\tau_{\text{rest},i}$
-(the $|\hat\omega|$ term would leak into $\omega$ the same way; it is left out for clarity):
+Suppose wheel $i$'s measured torque $\tau_i$ were used to update the state. Like every update, it
+would need a measurement model $h_\tau(\mathbf x)$: the torque the wheel should need, as a function of
+the state. The torque model above is that function; $\hat\tau_i$ is its value at the current
+estimate, $\hat\tau_i = h_\tau(\hat{\mathbf x})$:
 
 ```math
-h_\tau(\mathbf x) = c_{1,i}\,(a_f - b_a) + \tau_{\text{rest},i}, \qquad
-H_{\tau,b_a} = \frac{\partial h_\tau}{\partial b_a} = -c_{1,i}
+h_\tau(\mathbf x) = c_{1,i}\,(a_f - b_a) + c_{5,i}\,|\omega| + \tau_{\text{rest},i}, \qquad
+\tau_{\text{rest},i} = c_{2,i}\tanh\!\Big(\frac{\dot\theta_i}{0.05}\Big) + c_{3,i}\,\dot\theta_i + c_{4,i}\,\ddot\theta_i
 ```
 
-**1. Fault onset.** A slipping wheel needs $\Delta\tau > 0$ less torque than the model predicts.
-With $\hat b_a = b_a$:
+Its terms fall into two groups:
+- **Measured inputs** $a_f$, $\dot\theta_i$, $\ddot\theta_i$ come from sensors. The update cannot change
+  them.
+- **States** $b_a$ and $\omega$. They are the only quantities the update can change.
+
+An update moves the state by $K\tilde y$, with $K = PH^\top/S$, so it changes the states that have a
+non-zero entry in $H$:
 
 ```math
-\tau_i = c_{1,i}\,(a_f - b_a) + \tau_{\text{rest},i} - \Delta\tau
-\quad\Rightarrow\quad
-\tilde y_0 = \tau_i - h_\tau(\hat{\mathbf x}) = -\Delta\tau
+H_{\tau,b_a} = \frac{\partial h_\tau}{\partial b_a} = -c_{1,i}, \qquad
+H_{\tau,\omega} = \frac{\partial h_\tau}{\partial \omega} = c_{5,i}\operatorname{sign}(\omega)
+```
+
+Of these two, $b_a$ moves much more. The gyro measures $\omega$ at every step, so $P_{\omega\omega}$ is
+small and the gain on $\omega$ is small. No sensor measures $b_a$ directly, so $P_{b_a b_a}$ stays
+larger. The derivation below therefore keeps only $b_a$. It shows that the update keeps changing
+$\hat b_a$ until $h_\tau(\hat{\mathbf x}) = \tau_i$: the torque discrepancy disappears from the
+innovation and reappears as an error in $\hat b_a$.
+
+**1. Fault onset.** A slipping wheel needs $\Delta\tau > 0$ less torque than a healthy one. Its
+measured torque, written with the true $b_a$ and $\omega$, is
+
+```math
+\tau_i = c_{1,i}\,(a_f - b_a) + c_{5,i}\,|\omega| + \tau_{\text{rest},i} - \Delta\tau
+```
+
+The expected reading uses the estimates instead:
+
+```math
+h_\tau(\hat{\mathbf x}) = c_{1,i}\,(a_f - \hat b_a) + c_{5,i}\,|\hat\omega| + \tau_{\text{rest},i}
+```
+
+Assume the estimates are correct when the fault starts, $\hat b_a = b_a$ and $\hat\omega = \omega$. All
+terms except $\Delta\tau$ then cancel:
+
+```math
+\tilde y_0 = \tau_i - h_\tau(\hat{\mathbf x})
+= c_{1,i}\,(\hat b_a - b_a) + c_{5,i}\,(|\omega| - |\hat\omega|) - \Delta\tau
+= -\Delta\tau
 ```
 
 **2. One update**, with $P = P_{b_a b_a}$ and $R_\tau$ the torque noise variance:
@@ -814,31 +918,73 @@ Windows close on simulation time inside the filter, independent of when the down
 window also reports the mean NIS per channel; for the wheels, that is the NIS averaged over the six
 rolling innovations.
 
-**Two-sided CUSUM per residual**, updated once per window:
+**Two-sided CUSUM per residual**, updated once per window. $w = 1, 2, 3, \dots$ is the window index,
+so a subscript $w$ means "the value for window $w$" and $w-1$ the previous window:
 
 ```math
-z_w = \frac{\bar e_w}{\sigma_w},\qquad
-S^+_w = \max(0,\ S^+_{w-1} + z_w - \kappa),\qquad
-S^-_w = \max(0,\ S^-_{w-1} - z_w - \kappa),\qquad
-\text{alarm} \iff \max(S^+_w, S^-_w) > h
+\ell_w = \frac{\bar e_w}{\sigma_{\bar e}},\qquad
+C^+_w = \max(0,\ C^+_{w-1} + \ell_w - \kappa),\qquad
+C^-_w = \max(0,\ C^-_{w-1} - \ell_w - \kappa),\qquad
+\text{alarm} \iff \max(C^+_w, C^-_w) > \lambda
 ```
 
-- $\sigma_w$ = `cusum.window_sigma[key]` is the standard deviation of that residual's window mean on
-  nominal data. It is not $1/\sqrt{30}$, because real residuals are correlated in time.
-- $\kappa$ = `drift` = 0.5 is the smallest shift of interest, in units of $\sigma_w$.
-- $h$ = `cusum.thresholds[key]` is fitted per residual: $h = \max(10,\ 1.5\cdot\max_{\text{nominal}} S)$.
-  Effort and tracking carry slow terrain-dependent offsets that a single white-noise threshold
-  reads as faults. With the fitted thresholds, a held-out nominal episode raises no alarm.
+with $C^+_0 = C^-_0 = 0$.
+- $\sigma_{\bar e}$ = `cusum.window_sigma[key]` is the standard deviation of that residual's window
+  mean $\bar e$ on nominal data: one fixed value per residual, not per window. It is not
+  $1/\sqrt{30}$, because real residuals are correlated in time. On nominal data $\ell_w \approx \mathcal N(0, 1)$.
+- $C^+_w$ and $C^-_w$ are the upper and lower CUSUM statistics. $C^+$ accumulates evidence of a
+  positive shift in the mean, $C^-$ of a negative one; both reset to 0 when the evidence goes away.
+- $\kappa$ = `drift` = 0.5 is the reference value: half the design shift $\mu_1 = 1$, in units of
+  $\sigma_{\bar e}$.
+- $\lambda$ = `cusum.thresholds[key]` is the alarm threshold, fitted per residual:
+  $\lambda = \max(10,\ 1.5\cdot\max_{\text{nominal}} C)$, where $C$ is $C^+$ or $C^-$. Effort and
+  tracking carry slow terrain-dependent offsets that a single white-noise threshold reads as faults.
+  With the fitted thresholds, a held-out nominal episode raises no alarm. What this does and does not
+  guarantee is explained below.
 - Running the CUSUM on the raw 30 Hz samples instead would false-alarm every ~15 s.
-- For reference, the Siegmund approximation of the mean run length of a one-sided CUSUM with a true
-  shift $\mu$ (`monitor.cusum_mean_run_length`) is
 
-  ```math
-  \text{ARL}(\mu) \approx \frac{e^{-2\Delta b} + 2\Delta b - 1}{2\Delta^2},\qquad \Delta = \mu - \kappa,\quad b = h + 1.166
-  ```
+**Why $\ell_w - \kappa$: the log-likelihood ratio.** Page's CUSUM sums the log-likelihood ratio of
+"shifted" against "nominal". For $H_0: \ell \sim \mathcal N(0, 1)$ and $H_1: \ell \sim \mathcal N(\mu_1, 1)$:
 
-  With $\kappa = 0.5$ and $h = 10$ this gives about 20 h between false alarms per residual on white
-  noise.
+```math
+\ln\frac{p_1(\ell_w)}{p_0(\ell_w)} = -\frac{(\ell_w - \mu_1)^2}{2} + \frac{\ell_w^2}{2} = \mu_1\Big(\ell_w - \frac{\mu_1}{2}\Big)
+```
+
+Dividing the textbook recursion by $\mu_1 > 0$ does not change when it alarms, and gives the one above
+with $\kappa = \mu_1/2$ and $\lambda = \lambda_{\text{LLR}}/\mu_1$, where $\lambda_{\text{LLR}}$ is the
+threshold on the summed log-likelihood ratio. With $\kappa = 0.5$, $\mu_1 = 1$, so
+$\ell_w - \kappa$ is exactly the per-window log-likelihood ratio; $C^-$ is the same test with
+$\mu_1 = -1$. This holds only if the $\ell_w$ are independent, Gaussian and unit-variance under
+$H_0$. Real residuals are correlated in time, at two levels, and the fitted parameters handle only
+the first:
+- **Within a window: handled.** The ~30 samples in a window are correlated, so the variance of their
+  mean is not $\sigma^2/30$. Measuring $\sigma_{\bar e}$ on nominal data gives the true variance of
+  $\bar e_w$, so each $\ell_w$ has unit variance.
+- **Between windows: not handled.** Slow offsets (for example terrain, in effort and tracking) give
+  neighbouring $\ell_w$ the same sign. With correlation $\rho_{jk}$ between windows $j$ and $k$,
+  $\operatorname{Var}\big(\sum_{w=1}^{n}\ell_w\big) = n + 2\sum_{j<k}\rho_{jk} > n$, so $C^+$ and $C^-$
+  grow faster than the white-noise theory assumes. $\ell_w - \kappa$ is then no longer the exact
+  log-likelihood ratio.
+
+Fitting $\lambda$ is an empirical margin for the second level, not a correction. It guarantees no
+alarm on the nominal training data, and none occurred on one held-out episode, but it does not give a
+known false-alarm rate, and the larger $\lambda$ delays detection. Standard ways to remove the
+between-window correlation would be to run the CUSUM on the one-step prediction errors of an
+autoregressive (AR) model fitted to nominal $\bar e_w$ (whitening), or to model the slow offsets so
+they leave the residual.
+
+**Average run length (reference only).** The Siegmund approximation of the average number of windows
+before a one-sided CUSUM alarms, for a true shift $\mu$ in units of $\sigma_{\bar e}$
+(`monitor.cusum_mean_run_length`), is
+
+```math
+\text{ARL}(\mu) \approx \frac{e^{-2 d\, b} + 2 d\, b - 1}{2 d^2},\qquad d = \mu - \kappa,\quad b = \lambda + 1.166
+```
+
+With $\kappa = 0.5$ and $\lambda = 10$, $\text{ARL}(0) \approx 1.4\times10^5$ windows (39 hours) per side. The
+two sides together alarm about twice as often: about 20 hours between false alarms per residual, on
+white noise. Real residuals are correlated between windows, so the actual interval is shorter and
+not known.
 
 The alarms are packed into `cusum_alarm`, one bit per residual in `nav_filter.RESIDUAL_KEYS` order:
 
@@ -868,10 +1014,10 @@ The alarms are packed into `cusum_alarm`, one bit per residual in `nav_filter.RE
 | `wheel_effort_{mean,max}` [6] | $e_{\tau,i}$ (absent until the torque model is fitted) |
 | `wheel_tracking_{mean,max}` [6] | $e_{\text{trk},i}$ |
 | `cusum_alarm` | uint32 bitmask, above |
-| `reacquisitions` | episode count of gyro/heading reacquisitions |
+| `reacquisitions` | count of gyro/heading reacquisitions since the filter was reset; the dataset runner starts it at a Poisson draw for the counts since boot |
 
-- Wheel arrays are in the order front_left, front_right, mid_left, mid_right, rear_left, rear_right.
-  That differs from `motor_encoder`, which lists the left side first.
+- Wheel arrays are in the order front_left, front_right, mid_left, mid_right, rear_left, rear_right,
+  the same as `motor_encoder`, `motor_effort` and `wheel_speed_setpoint`.
 - In the dataset these are observable columns such as `estimator.wheel_rolling_mean.0`, since they
   are computed from the rover's own sensors.
 - A field the filter did not produce is *skipped*, never zero-filled, so missing reads as missing.
@@ -931,36 +1077,51 @@ The script runs these steps (truth is used only here, offline):
      is in [0.8, 1.25] or 8 passes have run.
    - The gyro and heading σ keep their measured values. Inflating them instead (tried first) hid the
      model errors and blunted both sensors.
-7. **CUSUM.** $\sigma_w$ is the std of each residual's nominal window means. $h$ is 1.5× the largest
-   nominal CUSUM level, as above.
+7. **CUSUM.** $\sigma_{\bar e}$ is the std of each residual's nominal window means. $\lambda$ is 1.5× the
+   largest nominal CUSUM statistic, as above.
+8. **Odometry noise $q_d$.** One more replay with $q_d = 0$ records the position error against the
+   truth, $P_{xx}$, $P_{yy}$ and the distance driven $d(t)$. Since the extra variance adds exactly,
+   $q_d$ is found by bisection: the smallest value for which
+   $|e_x| < 2\sqrt{P_{xx} + q_d d}$ and $|e_y| < 2\sqrt{P_{yy} + q_d d}$ hold on 91% of the samples.
 
-**Current fit** (4 nominal 600 s episodes, 72 000 samples):
+**Current fit** (14 nominal 600 s episodes, 252 000 samples, dataset seed 300, 2026-10-11; after the
+physics change to a free rocker-bogie with a differential, 25 kg wheels and articulation sleep off.
+Data and logs in `my_files/nav_refit/`):
 
-| Quantity | Value |
-|---|---|
-| Replay NIS | wheels 1.23, gyro 1.03, heading 0.87 |
-| $\sigma_{\text{wheel}}$, $\sigma_{\text{sideslip}}$ | 0.0156 m/s, 0.0047 m/s |
-| $\sigma_g$, $\sigma_\psi$ | 0.0084 rad/s, 0.00066 rad (0.04°) |
-| $\sigma_a$ | 0.40 m/s² (chassis vibration) |
-| $q_\omega$, $q_\psi$ | 0.0024 (rad/s)²/s, 1.4·10⁻⁵ rad²/s |
-| $k$ (`wheel_yaw_scale`) | 1.034 |
-| Torque model $R^2$ per 30 Hz sample | 0.09–0.23 (usable only through the windows) |
+| Quantity | Value | Previous fit (rigid suspension, 100 kg wheels) |
+|---|---|---|
+| Replay NIS | wheels 1.06, gyro 1.02, heading 0.81 | 1.23, 1.03, 0.87 |
+| $\sigma_{\text{wheel}}$, $\sigma_{\text{sideslip}}$ | 0.0220 m/s, 0.0066 m/s | 0.0156, 0.0047 |
+| $\sigma_g$, $\sigma_\psi$ | 0.0117 rad/s, 0.00083 rad (0.05°) | 0.0084, 0.00066 |
+| $\sigma_a$ | 0.28 m/s² (chassis vibration) | 0.40 |
+| $q_\omega$, $q_\psi$ | 0.0028 (rad/s)²/s, 6.9·10⁻⁶ rad²/s | 0.0024, 1.4·10⁻⁵ |
+| $k$ (`wheel_yaw_scale`) | 1.054 | 1.034 |
+| $q_d$ (`q_odometry`) | 0.00299 m²/m | 0.00329 |
+| $\sigma_{\text{trk}}$ (`tracking_sigma`) | 0.21 rad/s | 0.16 |
+| Torque model $R^2$ per 30 Hz sample | 0.12–0.30 (usable only through the windows) | 0.09–0.23 |
+
+The CUSUM thresholds are 17–50, except `wheel_tracking.rear_left` 227 and `rear_right` 194: on nominal
+driving the rear wheels lag their command by a steady +0.6σ, and a steady offset above the drift
+(0.5) keeps growing the statistic. A rear-wheel fault therefore has to be caught by its other
+residuals (rolling, side slip, effort), whose thresholds are 24–49.
 
 ## Validation in Isaac Sim
 
-Single-fault runs: 300 s each, fault onset at 150 s, fitted config, dataset seed 41 (not used for
-fitting). "Detected" is the first new CUSUM alarm after the onset; the σ values are post-onset window
-means.
+Single-fault runs: 2 × 300 s each, fault onset at 150 s, fitted config, dataset seed 41 (not used for
+fitting). Held-out nominal: 4 × 600 s, dataset seed 301. "Detected" is the first new CUSUM alarm
+after the onset; the σ values are the shift of the window means from before to after the onset. Scored
+by `my_files/nav_refit/evaluate.py` from the live 1 Hz telemetry (2026-10-11, current fit). The
+previous fit's result is in brackets.
 
 | Fault | Detected after | Signature |
 |---|---|---|
-| none (held out) | no alarm | all window means within ±0.3σ; $\hat b_g$ = 0.0002 rad/s |
-| `wheel_stuck:front_left:0.8` | 1 s | FL rolling −7.7σ, FL tracking +16.5σ |
-| `steer_stuck:front_left:30` | 4 s | FL side slip +5.6σ, FL rolling +2.9σ |
-| `wheel_sink:ALL:0.8` | 6 s | effort +0.6 to +1.7σ on every wheel |
-| `imu:0.5:0` | 1 s | $\hat b_g$ → 0.10 rad/s, heading −20σ, side slip −24σ on all wheels, lateral force +2.2σ |
-| `wheel_slip:ALL:0.8` | 20 s | weak shifts only (rolling ±0.8σ, effort up to +0.6σ) |
-| `wheel_slip:front_left:0.8` | **not detected** | — |
+| none (held out, 40 min) | no alarm [no alarm, 10 min] | — |
+| `wheel_stuck:front_left:0.8` | 1 s, 1 s [1 s] | FL tracking +11σ, FL rolling −7σ, FL effort −2.3σ |
+| `steer_stuck:front_left:30` | 4 s, 4 s [4 s] | FL side slip +6.4 to +7.1σ, FL rolling +2.3σ |
+| `wheel_sink:ALL:0.8` | 10 s, 9 s [6 s] | front effort +1.3 to +1.6σ, other wheels up to +0.8σ |
+| `imu:0.5:0` | 2 s, 1 s [1 s] | side slip about −40σ on all wheels, heading and lateral force alarms |
+| `wheel_slip:ALL:0.8` | 23 s, 9 s [20 s] | weak shifts only (side slip up to ±2.2σ, rolling −1.3σ) |
+| `wheel_slip:front_left:0.8` | **not detected** [not detected] | all shifts within ±0.2σ |
 
 What these runs show:
 - **One-wheel slip is invisible to these sensors.** The velocity drive keeps the slipping wheel on
